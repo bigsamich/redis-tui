@@ -215,6 +215,72 @@ impl RedisClient {
         Ok(entries)
     }
 
+    /// Blocking XREAD for new entries after `last_id`.
+    /// Blocks up to `timeout_ms` milliseconds (0 = forever).
+    /// Returns new entries (empty vec if timeout).
+    pub fn xread_blocking(&mut self, key: &str, last_id: &str, timeout_ms: u64) -> Result<Vec<StreamEntry>> {
+        let raw: redis::Value = redis::cmd("XREAD")
+            .arg("BLOCK")
+            .arg(timeout_ms)
+            .arg("COUNT")
+            .arg(100)
+            .arg("STREAMS")
+            .arg(key)
+            .arg(last_id)
+            .query(&mut self.connection)
+            .context("Failed to XREAD")?;
+
+        // XREAD returns: nil if no data, or array of [key, [[id, [field, val, ...]], ...]]
+        let streams = match raw {
+            redis::Value::Array(s) => s,
+            redis::Value::Nil => return Ok(Vec::new()),
+            _ => return Ok(Vec::new()),
+        };
+
+        let mut entries = Vec::new();
+        for stream_val in streams {
+            if let redis::Value::Array(parts) = stream_val {
+                if parts.len() >= 2 {
+                    // parts[0] = stream key, parts[1] = array of entries
+                    if let redis::Value::Array(entry_list) = &parts[1] {
+                        for entry_val in entry_list {
+                            if let redis::Value::Array(ep) = entry_val {
+                                if ep.len() >= 2 {
+                                    let id = match &ep[0] {
+                                        redis::Value::BulkString(b) => {
+                                            String::from_utf8_lossy(b).to_string()
+                                        }
+                                        _ => continue,
+                                    };
+                                    let mut fields = Vec::new();
+                                    if let redis::Value::Array(fv) = &ep[1] {
+                                        let mut i = 0;
+                                        while i + 1 < fv.len() {
+                                            let fname = match &fv[i] {
+                                                redis::Value::BulkString(b) => {
+                                                    String::from_utf8_lossy(b).to_string()
+                                                }
+                                                _ => { i += 2; continue; }
+                                            };
+                                            let fval = match &fv[i + 1] {
+                                                redis::Value::BulkString(b) => b.clone(),
+                                                _ => Vec::new(),
+                                            };
+                                            fields.push((fname, fval));
+                                            i += 2;
+                                        }
+                                    }
+                                    entries.push(StreamEntry { id, fields });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     pub fn delete_key(&mut self, key: &str) -> Result<()> {
         let _: () = self.connection
             .del(key)

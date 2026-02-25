@@ -12,8 +12,10 @@ use crossterm::{
     ExecutableCommand,
 };
 use ratatui::prelude::*;
-use redis_client::RedisClient;
+use redis_client::{RedisClient, StreamEntry};
 use std::io;
+use std::sync::mpsc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -73,7 +75,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend).context("Failed to create terminal")?;
 
     // Run app
-    let result = run_app(&mut terminal, &mut client);
+    let result = run_app(&mut terminal, &mut client, &url);
 
     // Restore terminal
     disable_raw_mode().context("Failed to disable raw mode")?;
@@ -85,9 +87,77 @@ fn main() -> Result<()> {
     result
 }
 
+/// State for managing the background XREAD thread
+#[allow(dead_code)]
+struct StreamListener {
+    rx: mpsc::Receiver<Vec<StreamEntry>>,
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// The key this listener was started for
+    watching_key: String,
+}
+
+impl StreamListener {
+    fn start(url: &str, key: &str, last_id: &str, db: i64) -> Option<Self> {
+        let mut client = RedisClient::connect(url).ok()?;
+        if db != 0 {
+            client.select_db(db).ok()?;
+        }
+        let (tx, rx) = mpsc::channel();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop = stop_flag.clone();
+        let watching_key = key.to_string();
+        let watching_id = last_id.to_string();
+        let thread_key = watching_key.clone();
+        let mut lid = watching_id.clone();
+
+        let handle = std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // Block up to 1s so we can check the stop flag periodically
+                match client.xread_blocking(&thread_key, &lid, 1000) {
+                    Ok(entries) if !entries.is_empty() => {
+                        if let Some(last) = entries.last() {
+                            lid = last.id.clone();
+                        }
+                        if tx.send(entries).is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    Ok(_) => {} // timeout, no data
+                    Err(_) => {
+                        // Connection error, back off briefly
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
+        });
+
+        Some(Self {
+            rx,
+            stop_flag,
+            handle: Some(handle),
+            watching_key,
+        })
+    }
+
+    fn stop(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for StreamListener {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &mut RedisClient,
+    redis_url: &str,
 ) -> Result<()> {
     let mut app = App::new();
     app.db = client.db;
@@ -96,17 +166,21 @@ fn run_app(
     app.refresh_keys(client);
     app.connected = client.is_connected();
 
+    let mut stream_listener: Option<StreamListener> = None;
+
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
-        // Poll for events with timeout for periodic refresh
-        if event::poll(Duration::from_millis(100))? {
+        // Poll for events with short timeout
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
+                // Stop stream listener on any navigation away
+                let prev_key = app.selected_key_name().map(|s| s.to_string());
+
                 match app.input_mode {
                     InputMode::Filter => handle_filter_input(&mut app, key.code),
                     InputMode::Confirm => handle_confirm_input(&mut app, client, key.code),
                     InputMode::Help => {
-                        // Any key closes help
                         app.input_mode = InputMode::Normal;
                     }
                     InputMode::Edit => {
@@ -116,13 +190,58 @@ fn run_app(
                         handle_plot_limit_input(&mut app, key.code)
                     }
                     InputMode::Normal => {
-                        handle_normal_input(&mut app, client, key.code, key.modifiers)
+                        handle_normal_input(&mut app, client, key.code, key.modifiers);
+
+                        // Toggle stream listener with 'p'
+                        if key.code == KeyCode::Char('p') && app.is_viewing_stream() {
+                            if stream_listener.is_some() {
+                                // Stop
+                                if let Some(mut sl) = stream_listener.take() {
+                                    sl.stop();
+                                }
+                                app.status_message = "Stream: stopped".to_string();
+                            } else {
+                                // Start
+                                if let (Some(k), Some(lid)) = (
+                                    app.selected_key_name().map(|s| s.to_string()),
+                                    app.last_stream_id.clone(),
+                                ) {
+                                    stream_listener =
+                                        StreamListener::start(redis_url, &k, &lid, app.db);
+                                    if stream_listener.is_some() {
+                                        app.status_message =
+                                            format!("Stream: listening on '{}'", k);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Stop listener if user navigated to a different key
+                        let new_key = app.selected_key_name().map(|s| s.to_string());
+                        if prev_key != new_key {
+                            if let Some(mut sl) = stream_listener.take() {
+                                sl.stop();
+                            }
+                        }
                     }
                 }
             }
         }
 
+        // Drain any new stream entries from the background listener
+        if let Some(ref listener) = stream_listener {
+            let mut total_new = 0;
+            while let Ok(entries) = listener.rx.try_recv() {
+                total_new += entries.len();
+                app.append_stream_entries(entries);
+            }
+            if total_new > 0 {
+                app.status_message = format!("Stream: +{} entries (live)", total_new);
+            }
+        }
+
         if !app.running {
+            drop(stream_listener);
             return Ok(());
         }
     }

@@ -71,8 +71,9 @@ pub struct App {
     pub current_value: Option<RedisValue>,
     pub value_scroll: u16,
 
-    // Stream expansion
+    // Stream state
     pub expanded_stream_entries: Vec<bool>,
+    pub last_stream_id: Option<String>, // for XREAD tracking
 
     // Data plot
     pub data_type: DataType,
@@ -120,6 +121,7 @@ impl App {
             value_scroll: 0,
 
             expanded_stream_entries: Vec::new(),
+            last_stream_id: None,
 
             data_type: DataType::UInt8,
             endianness: Endianness::Little,
@@ -197,6 +199,13 @@ impl App {
 
                 match client.get_value(key) {
                     Ok(value) => {
+                        // Track last stream ID for XREAD polling
+                        if let RedisValue::Stream(ref entries) = value {
+                            self.last_stream_id =
+                                entries.last().map(|e| e.id.clone());
+                        } else {
+                            self.last_stream_id = None;
+                        }
                         self.update_plot_data(&value);
                         self.current_value = Some(value);
                         self.value_scroll = 0;
@@ -205,10 +214,72 @@ impl App {
                         self.status_message = format!("Error reading value: {}", e);
                         self.current_value = None;
                         self.plot_data.clear();
+                        self.last_stream_id = None;
                     }
                 }
             }
         }
+    }
+
+    /// Append new stream entries from XREAD into the current value.
+    /// Returns true if new entries were added.
+    pub fn append_stream_entries(&mut self, new_entries: Vec<crate::redis_client::StreamEntry>) -> bool {
+        if new_entries.is_empty() {
+            return false;
+        }
+        // Update last_stream_id
+        if let Some(last) = new_entries.last() {
+            self.last_stream_id = Some(last.id.clone());
+        }
+        // Append to existing stream value
+        if let Some(RedisValue::Stream(ref mut entries)) = self.current_value {
+            entries.extend(new_entries);
+            // Recompute plot from updated stream
+            let value = RedisValue::Stream(entries.clone());
+            self.update_plot_data(&value);
+            if self.fft_enabled {
+                self.compute_fft();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reload the current value without resetting scroll.
+    #[allow(dead_code)]
+    pub fn refresh_selected_value(&mut self, client: &mut RedisClient) {
+        if let Some(idx) = self.key_list_state.selected() {
+            if idx < self.keys.len() {
+                let key = self.keys[idx].clone();
+
+                if let Ok(info) = client.get_key_info(&key) {
+                    self.current_key_info = Some(info);
+                }
+
+                match client.get_value(&key) {
+                    Ok(value) => {
+                        if let RedisValue::Stream(ref entries) = value {
+                            self.last_stream_id =
+                                entries.last().map(|e| e.id.clone());
+                        }
+                        self.update_plot_data(&value);
+                        if self.fft_enabled {
+                            self.compute_fft();
+                        }
+                        self.current_value = Some(value);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    pub fn is_viewing_stream(&self) -> bool {
+        matches!(
+            &self.current_key_info,
+            Some(info) if info.key_type == "stream"
+        )
     }
 
     fn update_plot_data(&mut self, value: &RedisValue) {

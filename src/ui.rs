@@ -425,6 +425,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
         Line::from("  s               Set/edit value"),
         Line::from("  n               New key"),
         Line::from("  d               Delete selected key"),
+        Line::from("  p               Toggle stream listen"),
         Line::from("  x               Set TTL"),
         Line::from("  R               Rename key"),
         Line::from("  0-9             Select database"),
