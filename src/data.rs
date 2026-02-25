@@ -1,0 +1,226 @@
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DataType {
+    Int8,
+    Int16,
+    Int32,
+    UInt8,
+    UInt16,
+    UInt32,
+    Float32,
+    Float64,
+    String,
+    Blob,
+}
+
+impl DataType {
+    #[allow(dead_code)]
+    pub fn byte_size(&self) -> Option<usize> {
+        match self {
+            DataType::Int8 | DataType::UInt8 => Some(1),
+            DataType::Int16 | DataType::UInt16 => Some(2),
+            DataType::Int32 | DataType::UInt32 | DataType::Float32 => Some(4),
+            DataType::Float64 => Some(8),
+            DataType::String | DataType::Blob => None,
+        }
+    }
+
+    pub fn all() -> &'static [DataType] {
+        &[
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::String,
+            DataType::Blob,
+        ]
+    }
+
+    pub fn next(&self) -> DataType {
+        let all = Self::all();
+        let idx = all.iter().position(|t| t == self).unwrap_or(0);
+        all[(idx + 1) % all.len()]
+    }
+
+    pub fn prev(&self) -> DataType {
+        let all = Self::all();
+        let idx = all.iter().position(|t| t == self).unwrap_or(0);
+        if idx == 0 {
+            all[all.len() - 1]
+        } else {
+            all[idx - 1]
+        }
+    }
+}
+
+impl fmt::Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataType::Int8 => write!(f, "int8"),
+            DataType::Int16 => write!(f, "int16"),
+            DataType::Int32 => write!(f, "int32"),
+            DataType::UInt8 => write!(f, "uint8"),
+            DataType::UInt16 => write!(f, "uint16"),
+            DataType::UInt32 => write!(f, "uint32"),
+            DataType::Float32 => write!(f, "float32"),
+            DataType::Float64 => write!(f, "float64"),
+            DataType::String => write!(f, "string"),
+            DataType::Blob => write!(f, "blob/hex"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Endianness {
+    Little,
+    Big,
+}
+
+impl Endianness {
+    pub fn toggle(&self) -> Endianness {
+        match self {
+            Endianness::Little => Endianness::Big,
+            Endianness::Big => Endianness::Little,
+        }
+    }
+}
+
+impl fmt::Display for Endianness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Endianness::Little => write!(f, "LE"),
+            Endianness::Big => write!(f, "BE"),
+        }
+    }
+}
+
+/// Decode raw bytes into a vector of f64 values for plotting
+pub fn decode_blob(bytes: &[u8], data_type: DataType, endianness: Endianness) -> Vec<f64> {
+    match data_type {
+        DataType::Int8 => bytes.iter().map(|&b| (b as i8) as f64).collect(),
+        DataType::UInt8 => bytes.iter().map(|&b| b as f64).collect(),
+        DataType::Int16 => decode_chunks(bytes, 2, |chunk| {
+            let arr: [u8; 2] = chunk.try_into().unwrap();
+            match endianness {
+                Endianness::Little => i16::from_le_bytes(arr) as f64,
+                Endianness::Big => i16::from_be_bytes(arr) as f64,
+            }
+        }),
+        DataType::UInt16 => decode_chunks(bytes, 2, |chunk| {
+            let arr: [u8; 2] = chunk.try_into().unwrap();
+            match endianness {
+                Endianness::Little => u16::from_le_bytes(arr) as f64,
+                Endianness::Big => u16::from_be_bytes(arr) as f64,
+            }
+        }),
+        DataType::Int32 => decode_chunks(bytes, 4, |chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap();
+            match endianness {
+                Endianness::Little => i32::from_le_bytes(arr) as f64,
+                Endianness::Big => i32::from_be_bytes(arr) as f64,
+            }
+        }),
+        DataType::UInt32 => decode_chunks(bytes, 4, |chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap();
+            match endianness {
+                Endianness::Little => u32::from_le_bytes(arr) as f64,
+                Endianness::Big => u32::from_be_bytes(arr) as f64,
+            }
+        }),
+        DataType::Float32 => decode_chunks(bytes, 4, |chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap();
+            match endianness {
+                Endianness::Little => f32::from_le_bytes(arr) as f64,
+                Endianness::Big => f32::from_be_bytes(arr) as f64,
+            }
+        }),
+        DataType::Float64 => decode_chunks(bytes, 8, |chunk| {
+            let arr: [u8; 8] = chunk.try_into().unwrap();
+            match endianness {
+                Endianness::Little => f64::from_le_bytes(arr),
+                Endianness::Big => f64::from_be_bytes(arr),
+            }
+        }),
+        DataType::String | DataType::Blob => {
+            // For string/blob, just plot byte values
+            bytes.iter().map(|&b| b as f64).collect()
+        }
+    }
+}
+
+fn decode_chunks(bytes: &[u8], chunk_size: usize, f: impl Fn(&[u8]) -> f64) -> Vec<f64> {
+    bytes
+        .chunks_exact(chunk_size)
+        .map(|chunk| f(chunk))
+        .collect()
+}
+
+/// Format raw bytes as a human-readable string according to data type
+#[allow(dead_code)]
+pub fn format_blob(bytes: &[u8], data_type: DataType, endianness: Endianness) -> String {
+    match data_type {
+        DataType::Blob => format_hex(bytes),
+        DataType::String => String::from_utf8_lossy(bytes).to_string(),
+        _ => {
+            let values = decode_blob(bytes, data_type, endianness);
+            if values.is_empty() {
+                return "(no complete values)".to_string();
+            }
+            let formatted: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    match data_type {
+                        DataType::Float32 | DataType::Float64 => format!("{:.6}", v),
+                        _ => format!("{}", *v as i64),
+                    }
+                })
+                .collect();
+            formatted.join(", ")
+        }
+    }
+}
+
+/// Format bytes as a hex dump with ASCII sidebar
+pub fn format_hex(bytes: &[u8]) -> String {
+    let mut result = String::new();
+    for (i, chunk) in bytes.chunks(16).enumerate() {
+        // Offset
+        result.push_str(&format!("{:08x}  ", i * 16));
+        // Hex bytes
+        for (j, byte) in chunk.iter().enumerate() {
+            result.push_str(&format!("{:02x} ", byte));
+            if j == 7 {
+                result.push(' ');
+            }
+        }
+        // Padding for incomplete lines
+        let padding = 16 - chunk.len();
+        for j in 0..padding {
+            result.push_str("   ");
+            if chunk.len() + j == 7 {
+                result.push(' ');
+            }
+        }
+        // ASCII
+        result.push_str(" |");
+        for byte in chunk {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                result.push(*byte as char);
+            } else {
+                result.push('.');
+            }
+        }
+        result.push_str("|\n");
+    }
+    result
+}
+
+/// Check if bytes look like they contain binary (non-UTF8 or control chars)
+pub fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
+}
