@@ -1,6 +1,8 @@
-use crate::data::{DataType, Endianness, decode_blob, is_binary};
+use crate::data::{DataType, Endianness, decode_blob, encode_values, is_binary};
 use crate::redis_client::{KeyInfo, RedisClient, RedisValue, StreamEntry};
 use ratatui::widgets::ListState;
+use rustfft::{FftPlanner, num_complex::Complex};
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
@@ -50,9 +52,20 @@ pub enum InputMode {
     Help,
     Edit,
     PlotLimit,
+    SignalGen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlotFocus {
+    Signal,
+    FFT,
 }
 
 pub const KEY_TYPES: &[&str] = &["string", "hash", "list", "set", "zset", "stream"];
+pub const WAVE_TYPES: &[&str] = &["sine", "square", "sawtooth", "triangle"];
+
+/// Default number of data points to show in auto-range plot mode
+pub const PLOT_WINDOW: usize = 2000;
 
 pub struct App {
     pub running: bool,
@@ -84,6 +97,38 @@ pub struct App {
     pub plot_y_max: f64,
     pub fft_enabled: bool,
     pub fft_data: Vec<f64>,
+    pub fft_computing: bool,
+    pub fft_rx: Option<mpsc::Receiver<Vec<f64>>>,
+    pub fft_auto_limits: bool,
+    pub fft_y_min: f64,
+    pub fft_y_max: f64,
+    pub fft_log_scale: bool,
+    pub plot_focus: PlotFocus, // which sub-plot is selected when FFT is on
+
+    // Plot viewport (x-axis panning/zooming)
+    pub plot_x_min: f64,
+    pub plot_x_max: f64,
+    pub fft_x_min: f64,
+    pub fft_x_max: f64,
+
+    // Mouse state
+    pub mouse_x: u16,         // terminal column
+    pub mouse_y: u16,         // terminal row
+    pub mouse_dragging: bool,
+    pub drag_start_x: u16,
+    pub drag_start_y: u16,
+    pub drag_start_plot_x_min: f64,
+    pub drag_start_plot_x_max: f64,
+    pub drag_start_plot_y_min: f64,
+    pub drag_start_plot_y_max: f64,
+    /// Data coordinates of hover position (if mouse is in a chart area)
+    pub hover_data_x: Option<f64>,
+    pub hover_data_y: Option<f64>,
+    pub hover_in_fft: bool,   // true if hovering in FFT chart
+
+    // Chart area rects (set during draw)
+    pub signal_chart_area: Option<(u16, u16, u16, u16)>, // x, y, w, h (inner)
+    pub fft_chart_area: Option<(u16, u16, u16, u16)>,
 
     // Connection
     pub db: i64,
@@ -101,6 +146,14 @@ pub struct App {
     pub edit_key: String,          // the key being edited
     pub edit_multi_count: usize,   // how many entries submitted in this session
     pub new_key_type_idx: usize,   // index into KEY_TYPES for new key creation
+    pub edit_binary_mode: bool,    // encode values as binary blobs
+    pub edit_binary_dtype_idx: usize, // index into DataType::all() for binary encoding
+
+    // Signal generator state
+    pub signal_gen_fields: Vec<(String, String)>,
+    pub signal_gen_focus: usize,
+    pub signal_gen_wave_idx: usize,
+    pub signal_gen_dtype_idx: usize,
 }
 
 impl App {
@@ -131,6 +184,34 @@ impl App {
             plot_y_max: 1.0,
             fft_enabled: false,
             fft_data: Vec::new(),
+            fft_computing: false,
+            fft_rx: None,
+            fft_auto_limits: true,
+            fft_y_min: 0.0,
+            fft_y_max: 1.0,
+            fft_log_scale: false,
+            plot_focus: PlotFocus::Signal,
+
+            plot_x_min: 0.0,
+            plot_x_max: 0.0, // 0 means auto (full range)
+            fft_x_min: 0.0,
+            fft_x_max: 0.0,
+
+            mouse_x: 0,
+            mouse_y: 0,
+            mouse_dragging: false,
+            drag_start_x: 0,
+            drag_start_y: 0,
+            drag_start_plot_x_min: 0.0,
+            drag_start_plot_x_max: 0.0,
+            drag_start_plot_y_min: 0.0,
+            drag_start_plot_y_max: 0.0,
+            hover_data_x: None,
+            hover_data_y: None,
+            hover_in_fft: false,
+
+            signal_chart_area: None,
+            fft_chart_area: None,
 
             db: 0,
             db_size: 0,
@@ -145,6 +226,13 @@ impl App {
             edit_key: String::new(),
             edit_multi_count: 0,
             new_key_type_idx: 0,
+            edit_binary_mode: false,
+            edit_binary_dtype_idx: 6, // Float32 default
+
+            signal_gen_fields: Vec::new(),
+            signal_gen_focus: 0,
+            signal_gen_wave_idx: 0,
+            signal_gen_dtype_idx: 7, // float32 index in DataType::all()
         }
     }
 
@@ -328,12 +416,21 @@ impl App {
             }
             _ => Vec::new(),
         };
+        // Sanitize: replace NaN/Infinity with 0.0 to prevent chart panics
+        for v in &mut self.plot_data {
+            if !v.is_finite() {
+                *v = 0.0;
+            }
+        }
     }
 
     pub fn recompute_plot(&mut self) {
         if let Some(value) = &self.current_value.clone() {
             self.update_plot_data(value);
         }
+        // Clear stale FFT data immediately so UI doesn't use mismatched data
+        self.fft_data.clear();
+        self.fft_chart_area = None;
         if self.fft_enabled {
             self.compute_fft();
         }
@@ -345,27 +442,176 @@ impl App {
             self.compute_fft();
         } else {
             self.fft_data.clear();
+            self.fft_computing = false;
+            self.fft_rx = None;
         }
     }
 
     pub fn compute_fft(&mut self) {
         if self.plot_data.is_empty() {
             self.fft_data.clear();
+            self.fft_computing = false;
+            self.fft_rx = None;
             return;
         }
-        self.fft_data = compute_fft_magnitude(&self.plot_data);
+        let data = self.plot_data.clone();
+        let (tx, rx) = mpsc::channel();
+        self.fft_rx = Some(rx);
+        self.fft_computing = true;
+        std::thread::spawn(move || {
+            let result = compute_fft_magnitude(&data);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Check if background FFT has completed; call this each tick.
+    pub fn poll_fft(&mut self) {
+        if let Some(ref rx) = self.fft_rx {
+            match rx.try_recv() {
+                Ok(data) => {
+                    self.fft_data = data;
+                    self.fft_computing = false;
+                    self.fft_rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.fft_computing = false;
+                    self.fft_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {} // still computing
+            }
+        }
     }
 
     pub fn set_auto_limits(&mut self) {
-        self.plot_auto_limits = true;
+        match self.plot_focus {
+            PlotFocus::Signal => {
+                self.plot_auto_limits = true;
+                self.plot_x_min = 0.0;
+                self.plot_x_max = 0.0;
+            }
+            PlotFocus::FFT => {
+                self.fft_auto_limits = true;
+                self.fft_x_min = 0.0;
+                self.fft_x_max = 0.0;
+            }
+        }
+    }
+
+    /// Get the x-axis bounds for the signal chart.
+    /// In auto mode, show the newest data (last PLOT_WINDOW points or fewer).
+    pub fn signal_x_bounds(&self) -> (f64, f64) {
+        let full = self.plot_data.len() as f64;
+        if self.plot_x_max <= self.plot_x_min {
+            // Auto: show last PLOT_WINDOW points
+            let window = PLOT_WINDOW as f64;
+            if full <= window {
+                (0.0, full)
+            } else {
+                (full - window, full)
+            }
+        } else {
+            (self.plot_x_min, self.plot_x_max)
+        }
+    }
+
+    /// Get the x-axis bounds for the FFT chart
+    pub fn fft_x_bounds(&self) -> (f64, f64) {
+        let full = self.fft_data.len() as f64;
+        if self.fft_x_max <= self.fft_x_min {
+            (0.0, full)
+        } else {
+            (self.fft_x_min, self.fft_x_max)
+        }
+    }
+
+    /// Zoom in/out on the focused plot. factor > 1 zooms in, < 1 zooms out.
+    /// center_frac is where in the viewport to zoom (0.0 = left, 1.0 = right)
+    pub fn zoom_plot(&mut self, factor: f64, center_frac_x: f64, center_frac_y: f64) {
+        let is_fft = self.hover_in_fft && self.fft_enabled;
+
+        if is_fft {
+            let (x0, x1) = self.fft_x_bounds();
+            let (y0, y1) = if self.fft_auto_limits {
+                self.auto_fft_bounds()
+            } else {
+                (self.fft_y_min, self.fft_y_max)
+            };
+            let full_x = self.fft_data.len() as f64;
+            let (nx0, nx1) = zoom_range(x0, x1, factor, center_frac_x, 0.0, full_x);
+            let (ny0, ny1) = zoom_range(y0, y1, factor, center_frac_y, f64::NEG_INFINITY, f64::INFINITY);
+            self.fft_x_min = nx0;
+            self.fft_x_max = nx1;
+            self.fft_y_min = ny0;
+            self.fft_y_max = ny1;
+            self.fft_auto_limits = false;
+        } else {
+            let (x0, x1) = self.signal_x_bounds();
+            let (y0, y1) = if self.plot_auto_limits {
+                self.auto_signal_bounds()
+            } else {
+                (self.plot_y_min, self.plot_y_max)
+            };
+            let full_x = self.plot_data.len() as f64;
+            let (nx0, nx1) = zoom_range(x0, x1, factor, center_frac_x, 0.0, full_x);
+            let (ny0, ny1) = zoom_range(y0, y1, factor, center_frac_y, f64::NEG_INFINITY, f64::INFINITY);
+            self.plot_x_min = nx0;
+            self.plot_x_max = nx1;
+            self.plot_y_min = ny0;
+            self.plot_y_max = ny1;
+            self.plot_auto_limits = false;
+        }
+    }
+
+    /// Convert terminal coordinates to chart data coordinates.
+    /// Returns (data_x, data_y) or None if outside chart area.
+    pub fn mouse_to_data(&self, col: u16, row: u16) -> Option<(f64, f64, bool)> {
+        // Check FFT chart first (if it exists)
+        if let Some((cx, cy, cw, ch)) = self.fft_chart_area {
+            if col >= cx && col < cx + cw && row >= cy && row < cy + ch {
+                let (x0, x1) = self.fft_x_bounds();
+                let (y0, y1) = if self.fft_auto_limits {
+                    self.auto_fft_bounds()
+                } else {
+                    (self.fft_y_min, self.fft_y_max)
+                };
+                let frac_x = (col - cx) as f64 / cw.max(1) as f64;
+                let frac_y = 1.0 - (row - cy) as f64 / ch.max(1) as f64;
+                let dx = x0 + frac_x * (x1 - x0);
+                let dy = y0 + frac_y * (y1 - y0);
+                return Some((dx, dy, true));
+            }
+        }
+        // Check signal chart
+        if let Some((cx, cy, cw, ch)) = self.signal_chart_area {
+            if col >= cx && col < cx + cw && row >= cy && row < cy + ch {
+                let (x0, x1) = self.signal_x_bounds();
+                let (y0, y1) = if self.plot_auto_limits {
+                    self.auto_signal_bounds()
+                } else {
+                    (self.plot_y_min, self.plot_y_max)
+                };
+                let frac_x = (col - cx) as f64 / cw.max(1) as f64;
+                let frac_y = 1.0 - (row - cy) as f64 / ch.max(1) as f64;
+                let dx = x0 + frac_x * (x1 - x0);
+                let dy = y0 + frac_y * (y1 - y0);
+                return Some((dx, dy, false));
+            }
+        }
+        None
     }
 
     pub fn start_set_plot_limits(&mut self) {
-        // Pre-fill with current auto-computed limits
-        let (y_min, y_max) = self.auto_y_bounds();
+        let (y_min, y_max) = match self.plot_focus {
+            PlotFocus::Signal => self.auto_signal_bounds(),
+            PlotFocus::FFT => self.auto_fft_bounds(),
+        };
+        let label = match self.plot_focus {
+            PlotFocus::Signal => "Signal",
+            PlotFocus::FFT => "FFT",
+        };
         self.edit_fields = vec![
-            ("Y Min".to_string(), format!("{:.2}", y_min)),
-            ("Y Max".to_string(), format!("{:.2}", y_max)),
+            (format!("{} Y Min", label), format!("{:.2}", y_min)),
+            (format!("{} Y Max", label), format!("{:.2}", y_max)),
         ];
         self.edit_focus = 0;
         self.input_mode = InputMode::PlotLimit;
@@ -385,22 +631,40 @@ impl App {
         if y_min >= y_max {
             return Err("Y Min must be less than Y Max".to_string());
         }
-        self.plot_y_min = y_min;
-        self.plot_y_max = y_max;
-        self.plot_auto_limits = false;
+        match self.plot_focus {
+            PlotFocus::Signal => {
+                self.plot_y_min = y_min;
+                self.plot_y_max = y_max;
+                self.plot_auto_limits = false;
+            }
+            PlotFocus::FFT => {
+                self.fft_y_min = y_min;
+                self.fft_y_max = y_max;
+                self.fft_auto_limits = false;
+            }
+        }
         Ok(())
     }
 
-    /// Compute auto y-bounds from current plot data
-    pub fn auto_y_bounds(&self) -> (f64, f64) {
-        if self.plot_data.is_empty() {
-            return (0.0, 1.0);
+    pub fn auto_signal_bounds(&self) -> (f64, f64) {
+        auto_bounds(&self.plot_data)
+    }
+
+    pub fn auto_fft_bounds(&self) -> (f64, f64) {
+        let data = self.fft_display_data();
+        auto_bounds(&data)
+    }
+
+    /// Get FFT data for display (applies log scale if enabled)
+    pub fn fft_display_data(&self) -> Vec<f64> {
+        if self.fft_log_scale {
+            self.fft_data
+                .iter()
+                .map(|&v| if v > 0.0 { v.log10() } else { -10.0 })
+                .collect()
+        } else {
+            self.fft_data.clone()
         }
-        let y_min = self.plot_data.iter().cloned().fold(f64::INFINITY, f64::min);
-        let y_max = self.plot_data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let range = y_max - y_min;
-        let pad = if range == 0.0 { 1.0 } else { range * 0.1 };
-        (y_min - pad, y_max + pad)
     }
 
     pub fn select_next_key(&mut self) {
@@ -465,10 +729,19 @@ impl App {
             None => vec!["(no value loaded)".to_string()],
             Some(RedisValue::String(bytes)) => {
                 if is_binary(bytes) {
-                    crate::data::format_hex(bytes)
-                        .lines()
-                        .map(|l| l.to_string())
-                        .collect()
+                    let mut lines = Vec::new();
+                    // Show decoded values using current data type
+                    lines.push(format!("── Decoded as {} ({}) ──", self.data_type, self.endianness));
+                    let decoded = crate::data::format_blob(bytes, self.data_type, self.endianness);
+                    for l in decoded.lines() {
+                        lines.push(l.to_string());
+                    }
+                    lines.push(String::new());
+                    lines.push(format!("── Hex dump ({} bytes) ──", bytes.len()));
+                    for l in crate::data::format_hex(bytes).lines() {
+                        lines.push(l.to_string());
+                    }
+                    lines
                 } else {
                     let s = String::from_utf8_lossy(bytes).to_string();
                     // Try to pretty-print JSON
@@ -517,7 +790,7 @@ impl App {
                     })
                     .collect()
             }
-            Some(RedisValue::Stream(entries)) => format_stream_entries(entries),
+            Some(RedisValue::Stream(entries)) => format_stream_entries(entries, self.data_type, self.endianness),
             Some(RedisValue::Unknown(msg)) => vec![msg.clone()],
         }
     }
@@ -635,12 +908,20 @@ impl App {
             None => return Err("No operation".to_string()),
         };
 
+        // Helper: encode value to binary if binary mode is on
+        let bin_dtype = DataType::all()[self.edit_binary_dtype_idx];
+        let bin_endian = self.endianness;
+        let binary_mode = self.edit_binary_mode;
+
         let result = match op {
             EditOperation::SetString => {
                 let value = &self.edit_fields[0].1;
-                client
-                    .set_string(&self.edit_key, value)
-                    .map_err(|e| e.to_string())
+                if binary_mode {
+                    let bytes = encode_values(value, bin_dtype, bin_endian)?;
+                    client.set_bytes(&self.edit_key, &bytes).map_err(|e| e.to_string())
+                } else {
+                    client.set_string(&self.edit_key, value).map_err(|e| e.to_string())
+                }
             }
             EditOperation::HSet => {
                 let field = &self.edit_fields[0].1;
@@ -648,15 +929,21 @@ impl App {
                 if field.is_empty() {
                     return Err("Field name is required".to_string());
                 }
-                client
-                    .hset(&self.edit_key, field, value)
-                    .map_err(|e| e.to_string())
+                if binary_mode {
+                    let bytes = encode_values(value, bin_dtype, bin_endian)?;
+                    client.hset_bytes(&self.edit_key, field, &bytes).map_err(|e| e.to_string())
+                } else {
+                    client.hset(&self.edit_key, field, value).map_err(|e| e.to_string())
+                }
             }
             EditOperation::RPush => {
                 let value = &self.edit_fields[0].1;
-                client
-                    .rpush(&self.edit_key, value)
-                    .map_err(|e| e.to_string())
+                if binary_mode {
+                    let bytes = encode_values(value, bin_dtype, bin_endian)?;
+                    client.rpush_bytes(&self.edit_key, &bytes).map_err(|e| e.to_string())
+                } else {
+                    client.rpush(&self.edit_key, value).map_err(|e| e.to_string())
+                }
             }
             EditOperation::LSet => {
                 let index: i64 = self.edit_fields[0]
@@ -664,15 +951,21 @@ impl App {
                     .parse()
                     .map_err(|_| "Invalid index".to_string())?;
                 let value = &self.edit_fields[1].1;
-                client
-                    .lset(&self.edit_key, index, value)
-                    .map_err(|e| e.to_string())
+                if binary_mode {
+                    let bytes = encode_values(value, bin_dtype, bin_endian)?;
+                    client.lset_bytes(&self.edit_key, index, &bytes).map_err(|e| e.to_string())
+                } else {
+                    client.lset(&self.edit_key, index, value).map_err(|e| e.to_string())
+                }
             }
             EditOperation::SAdd => {
                 let member = &self.edit_fields[0].1;
-                client
-                    .sadd(&self.edit_key, member)
-                    .map_err(|e| e.to_string())
+                if binary_mode {
+                    let bytes = encode_values(member, bin_dtype, bin_endian)?;
+                    client.sadd_bytes(&self.edit_key, &bytes).map_err(|e| e.to_string())
+                } else {
+                    client.sadd(&self.edit_key, member).map_err(|e| e.to_string())
+                }
             }
             EditOperation::ZAdd => {
                 let score: f64 = self.edit_fields[0]
@@ -680,9 +973,12 @@ impl App {
                     .parse()
                     .map_err(|_| "Invalid score (must be a number)".to_string())?;
                 let member = &self.edit_fields[1].1;
-                client
-                    .zadd(&self.edit_key, score, member)
-                    .map_err(|e| e.to_string())
+                if binary_mode {
+                    let bytes = encode_values(member, bin_dtype, bin_endian)?;
+                    client.zadd_bytes(&self.edit_key, score, &bytes).map_err(|e| e.to_string())
+                } else {
+                    client.zadd(&self.edit_key, score, member).map_err(|e| e.to_string())
+                }
             }
             EditOperation::XAdd => {
                 let field = &self.edit_fields[0].1;
@@ -690,9 +986,12 @@ impl App {
                 if field.is_empty() {
                     return Err("Field name is required".to_string());
                 }
-                client
-                    .xadd(&self.edit_key, field, value)
-                    .map_err(|e| e.to_string())
+                if binary_mode {
+                    let bytes = encode_values(value, bin_dtype, bin_endian)?;
+                    client.xadd_binary(&self.edit_key, field, &bytes).map_err(|e| e.to_string())
+                } else {
+                    client.xadd(&self.edit_key, field, value).map_err(|e| e.to_string())
+                }
             }
             EditOperation::SetTTL => {
                 let ttl_str = self.edit_fields[0].1.trim().to_string();
@@ -723,14 +1022,27 @@ impl App {
                     return Err("Key name is required".to_string());
                 }
                 let key_type = KEY_TYPES[self.new_key_type_idx];
-                match key_type {
-                    "string" => client.set_string(key, value).map_err(|e| e.to_string()),
-                    "hash" => client.hset(key, "field", value).map_err(|e| e.to_string()),
-                    "list" => client.rpush(key, value).map_err(|e| e.to_string()),
-                    "set" => client.sadd(key, value).map_err(|e| e.to_string()),
-                    "zset" => client.zadd(key, 0.0, value).map_err(|e| e.to_string()),
-                    "stream" => client.xadd(key, "data", value).map_err(|e| e.to_string()),
-                    _ => Err(format!("Unknown type: {}", key_type)),
+                if binary_mode {
+                    let bytes = encode_values(value, bin_dtype, bin_endian)?;
+                    match key_type {
+                        "string" => client.set_bytes(key, &bytes).map_err(|e| e.to_string()),
+                        "hash" => client.hset_bytes(key, "field", &bytes).map_err(|e| e.to_string()),
+                        "list" => client.rpush_bytes(key, &bytes).map_err(|e| e.to_string()),
+                        "set" => client.sadd_bytes(key, &bytes).map_err(|e| e.to_string()),
+                        "zset" => client.zadd_bytes(key, 0.0, &bytes).map_err(|e| e.to_string()),
+                        "stream" => client.xadd_binary(key, "data", &bytes).map_err(|e| e.to_string()),
+                        _ => Err(format!("Unknown type: {}", key_type)),
+                    }
+                } else {
+                    match key_type {
+                        "string" => client.set_string(key, value).map_err(|e| e.to_string()),
+                        "hash" => client.hset(key, "field", value).map_err(|e| e.to_string()),
+                        "list" => client.rpush(key, value).map_err(|e| e.to_string()),
+                        "set" => client.sadd(key, value).map_err(|e| e.to_string()),
+                        "zset" => client.zadd(key, 0.0, value).map_err(|e| e.to_string()),
+                        "stream" => client.xadd(key, "data", value).map_err(|e| e.to_string()),
+                        _ => Err(format!("Unknown type: {}", key_type)),
+                    }
                 }
             }
         };
@@ -742,6 +1054,7 @@ impl App {
         self.edit_operation = None;
         self.edit_fields.clear();
         self.edit_focus = 0;
+        self.edit_binary_mode = false;
         self.input_mode = InputMode::Normal;
     }
 
@@ -787,24 +1100,161 @@ impl App {
         self.edit_focus = 0;
         self.edit_multi_count += 1;
     }
+
+    // ─── Signal generator ─────────────────────────────────────
+
+    pub fn start_signal_gen_popup(&mut self) {
+        self.signal_gen_wave_idx = 0;
+        self.signal_gen_dtype_idx = 6; // float32
+        self.signal_gen_fields = vec![
+            ("Cycles/Entry".to_string(), "1.0".to_string()),
+            ("Amplitude".to_string(), "1.0".to_string()),
+            ("Noise".to_string(), "0.0".to_string()),
+            ("Samples/Entry".to_string(), "100".to_string()),
+            ("Entries/Sec".to_string(), "10.0".to_string()),
+        ];
+        self.signal_gen_focus = 0;
+        self.input_mode = InputMode::SignalGen;
+    }
+
+    pub fn signal_gen_next_field(&mut self) {
+        // 7 total focusable rows: wave type, data type, + 5 text fields
+        self.signal_gen_focus = (self.signal_gen_focus + 1) % 7;
+    }
+
+    pub fn signal_gen_prev_field(&mut self) {
+        if self.signal_gen_focus == 0 {
+            self.signal_gen_focus = 6;
+        } else {
+            self.signal_gen_focus -= 1;
+        }
+    }
+
+    pub fn signal_gen_wave_type(&self) -> &str {
+        WAVE_TYPES[self.signal_gen_wave_idx]
+    }
+
+    #[allow(dead_code)]
+    pub fn signal_gen_data_type(&self) -> DataType {
+        DataType::all()[self.signal_gen_dtype_idx]
+    }
 }
 
-fn format_stream_entries(entries: &[StreamEntry]) -> Vec<String> {
+/// Configuration for the signal generator thread
+#[derive(Debug, Clone)]
+pub struct SignalGenConfig {
+    pub wave_type: String,
+    pub data_type: DataType,
+    pub endianness: Endianness,
+    pub frequency: f64,
+    pub amplitude: f64,
+    pub samples_per_entry: usize,
+    pub entries_per_sec: f64,
+    pub noise: f64,
+}
+
+/// Encode a single f64 value into bytes for the given DataType + Endianness
+pub fn encode_wave_sample(val: f64, data_type: DataType, endianness: Endianness) -> Vec<u8> {
+    match (data_type, endianness) {
+        (DataType::Int8, _) => vec![(val.clamp(-128.0, 127.0) as i8) as u8],
+        (DataType::UInt8, _) => vec![val.clamp(0.0, 255.0) as u8],
+        (DataType::Int16, Endianness::Little) => (val.clamp(-32768.0, 32767.0) as i16).to_le_bytes().to_vec(),
+        (DataType::Int16, Endianness::Big) => (val.clamp(-32768.0, 32767.0) as i16).to_be_bytes().to_vec(),
+        (DataType::UInt16, Endianness::Little) => (val.clamp(0.0, 65535.0) as u16).to_le_bytes().to_vec(),
+        (DataType::UInt16, Endianness::Big) => (val.clamp(0.0, 65535.0) as u16).to_be_bytes().to_vec(),
+        (DataType::Int32, Endianness::Little) => (val.clamp(-2147483648.0, 2147483647.0) as i32).to_le_bytes().to_vec(),
+        (DataType::Int32, Endianness::Big) => (val.clamp(-2147483648.0, 2147483647.0) as i32).to_be_bytes().to_vec(),
+        (DataType::UInt32, Endianness::Little) => (val.clamp(0.0, 4294967295.0) as u32).to_le_bytes().to_vec(),
+        (DataType::UInt32, Endianness::Big) => (val.clamp(0.0, 4294967295.0) as u32).to_be_bytes().to_vec(),
+        (DataType::Float32, Endianness::Little) => (val as f32).to_le_bytes().to_vec(),
+        (DataType::Float32, Endianness::Big) => (val as f32).to_be_bytes().to_vec(),
+        (DataType::Float64, Endianness::Little) => val.to_le_bytes().to_vec(),
+        (DataType::Float64, Endianness::Big) => val.to_be_bytes().to_vec(),
+        (DataType::String, _) | (DataType::Blob, _) => (val as f32).to_le_bytes().to_vec(),
+    }
+}
+
+/// Generate one entry's worth of wave samples as a binary blob.
+/// `time_offset` is the cumulative phase offset (in cycles) so the wave
+/// continues seamlessly across entries.
+/// Frequency = number of complete cycles per entry.
+/// Amplitude = peak value of the wave.
+pub fn generate_wave_blob(config: &SignalGenConfig, time_offset: f64) -> Vec<u8> {
+    let mut blob = Vec::new();
+    let n = config.samples_per_entry as f64;
+    // Simple xorshift64 RNG seeded from time_offset bits
+    let mut rng_state: u64 = (time_offset.to_bits()).wrapping_add(0x9E3779B97F4A7C15);
+
+    for i in 0..config.samples_per_entry {
+        // phase in cycles: freq cycles per entry, offset keeps continuity
+        let phase = time_offset + config.frequency * (i as f64 / n);
+        let raw = match config.wave_type.as_str() {
+            "sine" => (2.0 * std::f64::consts::PI * phase).sin(),
+            "square" => {
+                if (2.0 * std::f64::consts::PI * phase).sin() >= 0.0 { 1.0 } else { -1.0 }
+            }
+            "sawtooth" => 2.0 * (phase.fract() + 1.0).fract() - 1.0,
+            "triangle" => {
+                let f = (phase.fract() + 1.0).fract();
+                4.0 * (f - 0.5).abs() - 1.0
+            }
+            _ => 0.0,
+        };
+        let mut val = config.amplitude * raw;
+        // Add noise: uniform random in [-noise, +noise]
+        if config.noise != 0.0 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let r = (rng_state as f64) / (u64::MAX as f64) * 2.0 - 1.0; // [-1, 1]
+            val += config.noise * r;
+        }
+        blob.extend(encode_wave_sample(val, config.data_type, config.endianness));
+    }
+    blob
+}
+
+fn format_stream_entries(entries: &[StreamEntry], data_type: DataType, endianness: Endianness) -> Vec<String> {
     let mut lines = Vec::new();
-    for entry in entries.iter().rev() {
-        lines.push(format!("--- {} ---", entry.id));
+    let total = entries.len();
+    // Show only last 5 entries (newest first)
+    let start = total.saturating_sub(5);
+    if start > 0 {
+        lines.push(format!("({} older entries hidden)", start));
+        lines.push(String::new());
+    }
+    for entry in entries[start..].iter().rev() {
+        let time_str = format_stream_id(&entry.id);
+        lines.push(format!("--- {} ({}) ---", entry.id, time_str));
         for (fname, fval) in &entry.fields {
             if fname.starts_with('_') && is_binary(fval) {
-                // Binary data field - show hex summary
+                // Binary data field - show decoded values + hex summary
+                let decoded = decode_blob(fval, data_type, endianness);
+                if !decoded.is_empty() {
+                    let preview: Vec<String> = decoded.iter().take(8).map(|v| {
+                        match data_type {
+                            DataType::Float32 | DataType::Float64 => format!("{:.4}", v),
+                            _ => format!("{}", *v as i64),
+                        }
+                    }).collect();
+                    let suffix = if decoded.len() > 8 {
+                        format!(" ..({} vals)", decoded.len())
+                    } else {
+                        String::new()
+                    };
+                    lines.push(format!("  {} [{}]: [{}]{}",
+                        fname, data_type, preview.join(", "), suffix));
+                }
+                // Hex summary
                 let hex: String = fval
                     .iter()
-                    .take(32)
+                    .take(24)
                     .map(|b| format!("{:02x}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let suffix = if fval.len() > 32 { "..." } else { "" };
+                let suffix = if fval.len() > 24 { "..." } else { "" };
                 lines.push(format!(
-                    "  {} [blob, {} bytes]: {}{}",
+                    "  {} [hex, {} bytes]: {}{}",
                     fname,
                     fval.len(),
                     hex,
@@ -819,24 +1269,80 @@ fn format_stream_entries(entries: &[StreamEntry]) -> Vec<String> {
     lines
 }
 
+/// Convert a Redis stream ID (unix_ms-seq) to a human-readable time string.
+/// Format: HH:MM:SS.mmm:seq
+fn format_stream_id(id: &str) -> String {
+    let parts: Vec<&str> = id.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return id.to_string();
+    }
+    let ms: u64 = match parts[0].parse() {
+        Ok(v) => v,
+        Err(_) => return id.to_string(),
+    };
+    let seq = parts[1];
+
+    let total_secs = ms / 1000;
+    let millis = ms % 1000;
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hrs = (total_secs / 3600) % 24;
+
+    format!("{:02}:{:02}:{:02}.{:03}:{}", hrs, mins, secs, millis, seq)
+}
+
 fn extract_stream_plot_data(
     entries: &[StreamEntry],
     data_type: DataType,
     endianness: Endianness,
 ) -> Vec<f64> {
-    let mut all_data = Vec::new();
-    for entry in entries {
+    // Only plot the newest (last) entry's waveform
+    if let Some(entry) = entries.last() {
         for (fname, fval) in &entry.fields {
             if fname.starts_with('_') {
-                let decoded = decode_blob(fval, data_type, endianness);
-                all_data.extend(decoded);
+                return decode_blob(fval, data_type, endianness);
             }
         }
     }
-    all_data
+    Vec::new()
 }
 
-/// Compute FFT magnitude spectrum using a naive DFT (no external crate needed).
+/// Zoom a range [lo, hi] by factor centered at frac (0..1).
+/// factor > 1 zooms in, < 1 zooms out. Clamps to [abs_min, abs_max].
+fn zoom_range(lo: f64, hi: f64, factor: f64, frac: f64, abs_min: f64, abs_max: f64) -> (f64, f64) {
+    let span = hi - lo;
+    let center = lo + frac * span;
+    let new_span = span / factor;
+    let mut new_lo = center - frac * new_span;
+    let mut new_hi = center + (1.0 - frac) * new_span;
+    if abs_min.is_finite() && new_lo < abs_min {
+        new_lo = abs_min;
+    }
+    if abs_max.is_finite() && new_hi > abs_max {
+        new_hi = abs_max;
+    }
+    if new_hi - new_lo < 1.0e-6 {
+        return (lo, hi); // prevent degenerate zoom
+    }
+    (new_lo, new_hi)
+}
+
+fn auto_bounds(data: &[f64]) -> (f64, f64) {
+    if data.is_empty() {
+        return (0.0, 1.0);
+    }
+    let y_min = data.iter().copied().filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min);
+    let y_max = data.iter().copied().filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+    // If all values were non-finite, return safe defaults
+    if !y_min.is_finite() || !y_max.is_finite() || y_min > y_max {
+        return (0.0, 1.0);
+    }
+    let range = y_max - y_min;
+    let pad = if range == 0.0 { 1.0 } else { range * 0.1 };
+    (y_min - pad, y_max + pad)
+}
+
+/// Compute FFT magnitude spectrum using rustfft (O(N log N)).
 /// Returns magnitudes for the first N/2 frequency bins (DC to Nyquist).
 fn compute_fft_magnitude(data: &[f64]) -> Vec<f64> {
     let n = data.len();
@@ -847,20 +1353,22 @@ fn compute_fft_magnitude(data: &[f64]) -> Vec<f64> {
     // Remove DC offset (mean) for better FFT visualization
     let mean = data.iter().sum::<f64>() / n as f64;
 
+    let mut buffer: Vec<Complex<f64>> = data
+        .iter()
+        .map(|&v| {
+            let val = if v.is_finite() { v - mean } else { 0.0 };
+            Complex::new(val, 0.0)
+        })
+        .collect();
+
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(n);
+    fft.process(&mut buffer);
+
     let half = n / 2;
-    let mut magnitudes = Vec::with_capacity(half);
-
-    for k in 0..half {
-        let mut re = 0.0;
-        let mut im = 0.0;
-        for (i, &val) in data.iter().enumerate() {
-            let angle = -2.0 * std::f64::consts::PI * (k as f64) * (i as f64) / (n as f64);
-            re += (val - mean) * angle.cos();
-            im += (val - mean) * angle.sin();
-        }
-        let mag = (re * re + im * im).sqrt() / (n as f64);
-        magnitudes.push(mag);
-    }
-
-    magnitudes
+    let inv_n = 1.0 / n as f64;
+    buffer[..half]
+        .iter()
+        .map(|c| c.norm() * inv_n)
+        .collect()
 }

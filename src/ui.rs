@@ -1,4 +1,5 @@
-use crate::app::{App, EditOperation, InputMode, Panel, KEY_TYPES};
+use crate::app::{App, EditOperation, InputMode, Panel, PlotFocus, KEY_TYPES, WAVE_TYPES};
+use crate::data::DataType;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -38,6 +39,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         InputMode::Help => draw_help_popup(frame, size),
         InputMode::Edit => draw_edit_popup(frame, app, size),
         InputMode::PlotLimit => draw_plot_limit_popup(frame, app, size),
+        InputMode::SignalGen => draw_signal_gen_popup(frame, app, size),
         InputMode::Normal => {}
     }
 }
@@ -55,27 +57,28 @@ fn draw_title_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
-    // Horizontal split: key list | right panels
+    // Vertical split: top row (keys + value) | bottom (full-width plot)
+    let v_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(area);
+
+    // Top row: key list | value view side by side
     let h_split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(25),
             Constraint::Percentage(75),
         ])
-        .split(area);
+        .split(v_split[0]);
 
     draw_key_list(frame, app, h_split[0]);
+    draw_value_view(frame, app, h_split[1]);
 
-    // Right side: vertical split for value view and data plot
-    let v_split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
-        ])
-        .split(h_split[1]);
-
-    draw_value_view(frame, app, v_split[0]);
+    // Bottom: full-width data plot
     draw_data_plot(frame, app, v_split[1]);
 }
 
@@ -181,7 +184,7 @@ fn draw_value_view(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let title = if app.active_panel == Panel::ValueView {
-        " Value [j/k]Scroll "
+        " Value [Up/Down]Scroll "
     } else {
         " Value "
     };
@@ -199,18 +202,28 @@ fn draw_value_view(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_data_plot(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_data_plot(frame: &mut Frame, app: &mut App, area: Rect) {
     let border_color = if app.active_panel == Panel::DataPlot {
         BORDER_ACTIVE
     } else {
         BORDER_INACTIVE
     };
 
-    let limits_label = if app.plot_auto_limits { "auto" } else { "manual" };
+    let focused_limits = match app.plot_focus {
+        PlotFocus::Signal => if app.plot_auto_limits { "auto" } else { "manual" },
+        PlotFocus::FFT => if app.fft_auto_limits { "auto" } else { "manual" },
+    };
     let fft_label = if app.fft_enabled { "ON" } else { "OFF" };
+    let log_label = if app.fft_enabled && app.fft_log_scale { " [g]log" } else if app.fft_enabled { " [g]linear" } else { "" };
+    let focus_label = if app.fft_enabled {
+        match app.plot_focus {
+            PlotFocus::Signal => " [Signal]",
+            PlotFocus::FFT => " [FFT]",
+        }
+    } else { "" };
     let title = format!(
-        " Plot [t]{} [e]{} [a/l]{} [f]FFT:{} ",
-        app.data_type, app.endianness, limits_label, fft_label
+        " Plot [t]{} [e]{} [a/l]{} [f]FFT:{}{}{}",
+        app.data_type, app.endianness, focused_limits, fft_label, log_label, focus_label
     );
 
     if app.plot_data.is_empty() {
@@ -226,20 +239,58 @@ fn draw_data_plot(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    if app.fft_enabled && !app.fft_data.is_empty() {
+    if app.fft_enabled {
         // Split area: top for signal, bottom for FFT
         let plot_split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
         draw_signal_chart(frame, app, plot_split[0], &title, border_color);
-        draw_fft_chart(frame, app, plot_split[1], border_color);
+        if app.fft_computing && app.fft_data.is_empty() {
+            let msg = Paragraph::new("Computing FFT...")
+                .style(Style::default().fg(Color::Yellow))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(" FFT "),
+                );
+            frame.render_widget(msg, plot_split[1]);
+        } else if !app.fft_data.is_empty() {
+            draw_fft_chart(frame, app, plot_split[1], border_color);
+        } else {
+            let msg = Paragraph::new("No FFT data")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(" FFT "),
+                );
+            frame.render_widget(msg, plot_split[1]);
+        }
     } else {
         draw_signal_chart(frame, app, area, &title, border_color);
     }
 }
 
-fn draw_signal_chart(frame: &mut Frame, app: &App, area: Rect, title: &str, border_color: Color) {
+/// Pick a chart marker that won't overflow for the given area.
+/// Braille (2x4 sub-pixels) is preferred but its BrailleGrid does `width * height` as u16,
+/// overflowing when the product exceeds 65535 (ratatui issue #1449).
+/// Fall back to HalfBlock which uses usize internally and is safe for any size.
+fn safe_marker(area: Rect) -> symbols::Marker {
+    if (area.width as u32) * (area.height as u32) <= 65535 {
+        symbols::Marker::Braille
+    } else {
+        symbols::Marker::HalfBlock
+    }
+}
+
+fn draw_signal_chart(frame: &mut Frame, app: &mut App, area: Rect, title: &str, border_color: Color) {
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+
     let data_points: Vec<(f64, f64)> = app
         .plot_data
         .iter()
@@ -247,17 +298,39 @@ fn draw_signal_chart(frame: &mut Frame, app: &App, area: Rect, title: &str, bord
         .map(|(i, v)| (i as f64, *v))
         .collect();
 
-    let x_max = data_points.len() as f64;
+    let (x_lo, x_hi) = app.signal_x_bounds();
 
     let (y_lo, y_hi) = if app.plot_auto_limits {
-        app.auto_y_bounds()
+        app.auto_signal_bounds()
     } else {
         (app.plot_y_min, app.plot_y_max)
     };
 
+    // Highlight border if this sub-plot is focused (when FFT is on)
+    let chart_border = if app.fft_enabled && app.plot_focus == PlotFocus::Signal {
+        Color::Cyan
+    } else if app.fft_enabled {
+        Color::DarkGray
+    } else {
+        border_color
+    };
+
+    // Build title with hover coords
+    let hover_suffix = if !app.hover_in_fft {
+        if let (Some(hx), Some(hy)) = (app.hover_data_x, app.hover_data_y) {
+            format!(" x:{:.1} y:{:.2}", hx, hy)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let full_title = format!("{}{} ", title, hover_suffix);
+
+    let marker = safe_marker(area);
     let datasets = vec![Dataset::default()
         .name(format!("{} values", app.plot_data.len()))
-        .marker(symbols::Marker::Braille)
+        .marker(marker)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Cyan))
         .data(&data_points)];
@@ -266,17 +339,17 @@ fn draw_signal_chart(frame: &mut Frame, app: &App, area: Rect, title: &str, bord
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(title.to_string()),
+                .border_style(Style::default().fg(chart_border))
+                .title(full_title),
         )
         .x_axis(
             Axis::default()
                 .title("Index")
-                .bounds([0.0, x_max])
+                .bounds([x_lo, x_hi])
                 .labels(vec![
-                    Line::from("0"),
-                    Line::from(format!("{}", x_max as i64 / 2)),
-                    Line::from(format!("{}", x_max as i64)),
+                    Line::from(format!("{:.0}", x_lo)),
+                    Line::from(format!("{:.0}", (x_lo + x_hi) / 2.0)),
+                    Line::from(format!("{:.0}", x_hi)),
                 ]),
         )
         .y_axis(
@@ -291,60 +364,117 @@ fn draw_signal_chart(frame: &mut Frame, app: &App, area: Rect, title: &str, bord
         );
 
     frame.render_widget(chart, area);
+
+    // Store chart inner area for mouse hit testing (inside borders)
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    // Approximate: ratatui chart uses ~7 chars for y-axis labels, 2 for x-axis
+    let chart_x = inner.x + 7;
+    let chart_y = inner.y;
+    let chart_w = inner.width.saturating_sub(7);
+    let chart_h = inner.height.saturating_sub(2);
+    app.signal_chart_area = Some((chart_x, chart_y, chart_w, chart_h));
+
+    // Draw crosshair tick marks if hovering in signal chart
+    if !app.hover_in_fft {
+        if let (Some(hx), Some(hy)) = (app.hover_data_x, app.hover_data_y) {
+            draw_crosshair(frame, chart_x, chart_y, chart_w, chart_h, hx, hy, x_lo, x_hi, y_lo, y_hi);
+        }
+    }
 }
 
-fn draw_fft_chart(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
-    let fft_points: Vec<(f64, f64)> = app
-        .fft_data
+fn draw_fft_chart(frame: &mut Frame, app: &mut App, area: Rect, _border_color: Color) {
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+
+    let display_data = app.fft_display_data();
+    let fft_points: Vec<(f64, f64)> = display_data
         .iter()
         .enumerate()
         .map(|(i, v)| (i as f64, *v))
         .collect();
 
-    let x_max = fft_points.len() as f64;
-    let y_max = app
-        .fft_data
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let y_hi = if y_max <= 0.0 { 1.0 } else { y_max * 1.1 };
+    let (x_lo, x_hi) = app.fft_x_bounds();
 
+    let (y_lo, y_hi) = if app.fft_auto_limits {
+        app.auto_fft_bounds()
+    } else {
+        (app.fft_y_min, app.fft_y_max)
+    };
+
+    // Highlight border if this sub-plot is focused
+    let chart_border = if app.plot_focus == PlotFocus::FFT {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+
+    let scale_label = if app.fft_log_scale { "log" } else { "linear" };
+    let hover_suffix = if app.hover_in_fft {
+        if let (Some(hx), Some(hy)) = (app.hover_data_x, app.hover_data_y) {
+            format!(" bin:{:.1} mag:{:.2}", hx, hy)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let fft_title = format!(" FFT Magnitude ({}){} ", scale_label, hover_suffix);
+
+    let marker = safe_marker(area);
     let datasets = vec![Dataset::default()
-        .name(format!("{} bins", app.fft_data.len()))
-        .marker(symbols::Marker::Braille)
+        .name(format!("{} bins", display_data.len()))
+        .marker(marker)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Yellow))
         .data(&fft_points)];
+
+    let y_title = if app.fft_log_scale { "log10(Mag)" } else { "Magnitude" };
 
     let chart = Chart::new(datasets)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(" FFT Magnitude "),
+                .border_style(Style::default().fg(chart_border))
+                .title(fft_title),
         )
         .x_axis(
             Axis::default()
                 .title("Bin")
-                .bounds([0.0, x_max])
+                .bounds([x_lo, x_hi])
                 .labels(vec![
-                    Line::from("0"),
-                    Line::from(format!("{}", x_max as i64 / 2)),
-                    Line::from(format!("{}", x_max as i64)),
+                    Line::from(format!("{:.0}", x_lo)),
+                    Line::from(format!("{:.0}", (x_lo + x_hi) / 2.0)),
+                    Line::from(format!("{:.0}", x_hi)),
                 ]),
         )
         .y_axis(
             Axis::default()
-                .title("Magnitude")
-                .bounds([0.0, y_hi])
+                .title(y_title)
+                .bounds([y_lo, y_hi])
                 .labels(vec![
-                    Line::from("0"),
-                    Line::from(format!("{:.2}", y_hi / 2.0)),
+                    Line::from(format!("{:.2}", y_lo)),
+                    Line::from(format!("{:.2}", (y_lo + y_hi) / 2.0)),
                     Line::from(format!("{:.2}", y_hi)),
                 ]),
         );
 
     frame.render_widget(chart, area);
+
+    // Store chart inner area for mouse hit testing
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let chart_x = inner.x + 7;
+    let chart_y = inner.y;
+    let chart_w = inner.width.saturating_sub(7);
+    let chart_h = inner.height.saturating_sub(2);
+    app.fft_chart_area = Some((chart_x, chart_y, chart_w, chart_h));
+
+    // Draw crosshair if hovering in FFT chart
+    if app.hover_in_fft {
+        if let (Some(hx), Some(hy)) = (app.hover_data_x, app.hover_data_y) {
+            draw_crosshair(frame, chart_x, chart_y, chart_w, chart_h, hx, hy, x_lo, x_hi, y_lo, y_hi);
+        }
+    }
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -408,24 +538,25 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_popup(frame: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(60, 20, area);
+    let popup_area = centered_rect(60, 23, area);
     frame.render_widget(Clear, popup_area);
 
     let help_text = vec![
         Line::from(Span::styled("Keyboard Shortcuts", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
         Line::from(""),
         Line::from(vec![Span::styled("Navigation", Style::default().fg(Color::Cyan))]),
-        Line::from("  Up/Down, j/k    Navigate key list"),
+        Line::from("  Up/Down         Navigate key list / scroll value"),
         Line::from("  Enter           Select key / load value"),
         Line::from("  Tab / Shift+Tab Cycle panels"),
         Line::from(""),
         Line::from(vec![Span::styled("Actions", Style::default().fg(Color::Cyan))]),
         Line::from("  /               Filter keys"),
         Line::from("  r               Refresh keys"),
-        Line::from("  s               Set/edit value"),
+        Line::from("  s               Set/edit value (Ctrl+B binary mode)"),
         Line::from("  n               New key"),
         Line::from("  d               Delete selected key"),
         Line::from("  p               Toggle stream listen"),
+        Line::from("  w               Signal generator (streams)"),
         Line::from("  x               Set TTL"),
         Line::from("  R               Rename key"),
         Line::from("  0-9             Select database"),
@@ -433,9 +564,11 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(vec![Span::styled("Data Plot", Style::default().fg(Color::Cyan))]),
         Line::from("  t / T           Cycle data type forward/back"),
         Line::from("  e               Toggle endianness (LE/BE)"),
-        Line::from("  a               Auto-fit Y limits"),
-        Line::from("  l               Set manual Y limits"),
+        Line::from("  a               Auto-fit Y limits (focused plot)"),
+        Line::from("  l               Set manual Y limits (focused plot)"),
         Line::from("  f               Toggle FFT analysis"),
+        Line::from("  g               Toggle FFT log/linear scale"),
+        Line::from("  Up/Down         Select signal/FFT plot (when FFT on)"),
         Line::from(""),
         Line::from(vec![Span::styled("General", Style::default().fg(Color::Cyan))]),
         Line::from("  ?               Toggle this help"),
@@ -506,13 +639,120 @@ fn draw_plot_limit_popup(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(popup, popup_area);
 }
 
+fn draw_signal_gen_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let popup_area = centered_rect(60, 18, area);
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Signal Generator",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Row 0: Wave Type selector
+    let wave_focused = app.signal_gen_focus == 0;
+    let wave_indicator = if wave_focused { "> " } else { "  " };
+    let wave_label_style = if wave_focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(wave_indicator, Style::default().fg(Color::Cyan)),
+        Span::styled("Wave: ", wave_label_style),
+        Span::styled("< ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            WAVE_TYPES[app.signal_gen_wave_idx],
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" >", Style::default().fg(Color::DarkGray)),
+        if wave_focused {
+            Span::raw("  (Left/Right)")
+        } else {
+            Span::raw("")
+        },
+    ]));
+
+    // Row 1: Data Type selector
+    let dtype_focused = app.signal_gen_focus == 1;
+    let dtype_indicator = if dtype_focused { "> " } else { "  " };
+    let dtype_label_style = if dtype_focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    let dtype_name = format!("{}", DataType::all()[app.signal_gen_dtype_idx]);
+    lines.push(Line::from(vec![
+        Span::styled(dtype_indicator, Style::default().fg(Color::Cyan)),
+        Span::styled("Type: ", dtype_label_style),
+        Span::styled("< ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            dtype_name,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" >", Style::default().fg(Color::DarkGray)),
+        if dtype_focused {
+            Span::raw("  (Left/Right)")
+        } else {
+            Span::raw("")
+        },
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Rows 2-5: Text input fields
+    for (i, (label, value)) in app.signal_gen_fields.iter().enumerate() {
+        let focus_idx = i + 2; // offset by 2 selector rows
+        let is_focused = app.signal_gen_focus == focus_idx;
+        let indicator = if is_focused { "> " } else { "  " };
+        let label_style = if is_focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let input_style = if is_focused {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let cursor = if is_focused { "_" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(indicator, Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{}: ", label), label_style),
+            Span::styled(format!("{}{}", value, cursor), input_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", Style::default().fg(Color::Green)),
+        Span::raw(" Start  "),
+        Span::styled("[Esc]", Style::default().fg(Color::Red)),
+        Span::raw(" Cancel  "),
+        Span::styled("[Tab]", Style::default().fg(Color::Yellow)),
+        Span::raw(" Next"),
+    ]));
+
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(HIGHLIGHT_COLOR))
+            .title(" Signal Generator "),
+    );
+    frame.render_widget(popup, popup_area);
+}
+
 fn draw_edit_popup(frame: &mut Frame, app: &App, area: Rect) {
     let field_count = app.edit_fields.len();
     let is_new_key = app.edit_operation == Some(EditOperation::NewKey);
     let is_multi = app.is_multi_entry_edit();
     let extra_type = if is_new_key { 2 } else { 0 };
     let extra_count = if is_multi && app.edit_multi_count > 0 { 1 } else { 0 };
-    let height = (5 + field_count * 2 + extra_type + extra_count).min(22) as u16;
+    let extra_binary = if app.edit_binary_mode { 2 } else { 1 }; // binary mode row + type/endian row
+    let height = (5 + field_count * 2 + extra_type + extra_count + extra_binary).min(24) as u16;
     let popup_area = centered_rect(60, height, area);
     frame.render_widget(Clear, popup_area);
 
@@ -559,6 +799,28 @@ fn draw_edit_popup(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    // Binary mode toggle
+    let bin_label = if app.edit_binary_mode { "ON" } else { "OFF" };
+    let bin_color = if app.edit_binary_mode { Color::Green } else { Color::DarkGray };
+    lines.push(Line::from(vec![
+        Span::styled("Binary: ", Style::default().fg(Color::Yellow)),
+        Span::styled(bin_label, Style::default().fg(bin_color).add_modifier(Modifier::BOLD)),
+        Span::styled("  [Ctrl+B]toggle", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    // Data type & endianness selectors (only when binary mode is on)
+    let dtype_name = format!("{}", DataType::all()[app.edit_binary_dtype_idx]);
+    let endian_name = format!("{}", app.endianness);
+    if app.edit_binary_mode {
+        lines.push(Line::from(vec![
+            Span::styled("  Encode: ", Style::default().fg(Color::Yellow)),
+            Span::styled(&dtype_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" / ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&endian_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("  [Ctrl+T]type [Ctrl+E]endian", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
     lines.push(Line::from(""));
 
     // Fields
@@ -585,6 +847,14 @@ fn draw_edit_popup(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{}: ", label), label_style),
             Span::styled(display_val, input_style),
         ]));
+    }
+
+    // Show hint about value format when binary mode is on
+    if app.edit_binary_mode {
+        lines.push(Line::from(Span::styled(
+            "  (enter comma/space-separated numbers)",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     lines.push(Line::from(""));
@@ -619,7 +889,86 @@ fn draw_edit_popup(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(popup, popup_area);
 }
 
-/// Create a centered rect with given percentage width and fixed height
+/// Draw crosshair tick marks at the hover position on both axes
+fn draw_crosshair(
+    frame: &mut Frame,
+    cx: u16, cy: u16, cw: u16, ch: u16,
+    data_x: f64, data_y: f64,
+    x_lo: f64, x_hi: f64, y_lo: f64, y_hi: f64,
+) {
+    if cw == 0 || ch == 0 || x_hi <= x_lo || y_hi <= y_lo {
+        return;
+    }
+    let frac_x = (data_x - x_lo) / (x_hi - x_lo);
+    let frac_y = (data_y - y_lo) / (y_hi - y_lo);
+
+    if frac_x < 0.0 || frac_x > 1.0 || frac_y < 0.0 || frac_y > 1.0 {
+        return;
+    }
+
+    let px = cx + (frac_x * cw as f64) as u16;
+    let py = cy + ((1.0 - frac_y) * ch as f64) as u16;
+
+    let crosshair_style = Style::default().fg(Color::White);
+
+    // Vertical line (sparse dashes)
+    for y in cy..cy + ch {
+        if y != py && y % 2 == 0 {
+            if px < cx + cw {
+                frame.render_widget(
+                    Paragraph::new("│").style(Style::default().fg(Color::DarkGray)),
+                    Rect::new(px, y, 1, 1),
+                );
+            }
+        }
+    }
+
+    // Horizontal line (sparse dashes)
+    for x in cx..cx + cw {
+        if x != px && x % 3 == 0 {
+            if py < cy + ch {
+                frame.render_widget(
+                    Paragraph::new("─").style(Style::default().fg(Color::DarkGray)),
+                    Rect::new(x, py, 1, 1),
+                );
+            }
+        }
+    }
+
+    // Crosshair center
+    if px < cx + cw && py < cy + ch {
+        frame.render_widget(
+            Paragraph::new("┼").style(crosshair_style),
+            Rect::new(px, py, 1, 1),
+        );
+    }
+
+    // X-axis tick mark (at bottom of chart area)
+    let tick_y = cy + ch;
+    if px < cx + cw && tick_y < cy + ch + 2 {
+        let label = format!("{:.1}", data_x);
+        let label_len = label.len() as u16;
+        let label_x = px.saturating_sub(label_len / 2);
+        if label_x + label_len <= cx + cw + 4 {
+            frame.render_widget(
+                Paragraph::new(label).style(Style::default().fg(Color::Yellow)),
+                Rect::new(label_x, tick_y, label_len + 1, 1),
+            );
+        }
+    }
+
+    // Y-axis tick mark (at left edge of chart area)
+    if py < cy + ch {
+        let label = format!("{:.2}", data_y);
+        let label_len = label.len() as u16;
+        let label_x = cx.saturating_sub(label_len + 1);
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(Color::Yellow)),
+            Rect::new(label_x, py, label_len + 1, 1),
+        );
+    }
+}
+
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)

@@ -315,6 +315,11 @@ impl RedisClient {
         Ok(())
     }
 
+    pub fn set_bytes(&mut self, key: &str, value: &[u8]) -> Result<()> {
+        let _: () = self.connection.set(key, value).context("Failed to SET bytes")?;
+        Ok(())
+    }
+
     pub fn hset(&mut self, key: &str, field: &str, value: &str) -> Result<()> {
         let _: () = self
             .connection
@@ -323,11 +328,27 @@ impl RedisClient {
         Ok(())
     }
 
+    pub fn hset_bytes(&mut self, key: &str, field: &str, value: &[u8]) -> Result<()> {
+        let _: () = self
+            .connection
+            .hset(key, field, value)
+            .context("Failed to HSET bytes")?;
+        Ok(())
+    }
+
     pub fn rpush(&mut self, key: &str, value: &str) -> Result<()> {
         let _: i64 = self
             .connection
             .rpush(key, value)
             .context("Failed to RPUSH")?;
+        Ok(())
+    }
+
+    pub fn rpush_bytes(&mut self, key: &str, value: &[u8]) -> Result<()> {
+        let _: i64 = self
+            .connection
+            .rpush(key, value)
+            .context("Failed to RPUSH bytes")?;
         Ok(())
     }
 
@@ -341,11 +362,29 @@ impl RedisClient {
         Ok(())
     }
 
+    pub fn lset_bytes(&mut self, key: &str, index: i64, value: &[u8]) -> Result<()> {
+        let _: () = redis::cmd("LSET")
+            .arg(key)
+            .arg(index)
+            .arg(value)
+            .query(&mut self.connection)
+            .context("Failed to LSET bytes")?;
+        Ok(())
+    }
+
     pub fn sadd(&mut self, key: &str, member: &str) -> Result<()> {
         let _: i64 = self
             .connection
             .sadd(key, member)
             .context("Failed to SADD")?;
+        Ok(())
+    }
+
+    pub fn sadd_bytes(&mut self, key: &str, member: &[u8]) -> Result<()> {
+        let _: i64 = self
+            .connection
+            .sadd(key, member)
+            .context("Failed to SADD bytes")?;
         Ok(())
     }
 
@@ -357,6 +396,14 @@ impl RedisClient {
         Ok(())
     }
 
+    pub fn zadd_bytes(&mut self, key: &str, score: f64, member: &[u8]) -> Result<()> {
+        let _: i64 = self
+            .connection
+            .zadd(key, member, score)
+            .context("Failed to ZADD bytes")?;
+        Ok(())
+    }
+
     pub fn xadd(&mut self, key: &str, field: &str, value: &str) -> Result<()> {
         let _: String = redis::cmd("XADD")
             .arg(key)
@@ -365,6 +412,17 @@ impl RedisClient {
             .arg(value)
             .query(&mut self.connection)
             .context("Failed to XADD")?;
+        Ok(())
+    }
+
+    pub fn xadd_binary(&mut self, key: &str, field: &str, value: &[u8]) -> Result<()> {
+        let _: String = redis::cmd("XADD")
+            .arg(key)
+            .arg("*")
+            .arg(field)
+            .arg(value)
+            .query(&mut self.connection)
+            .context("Failed to XADD binary")?;
         Ok(())
     }
 

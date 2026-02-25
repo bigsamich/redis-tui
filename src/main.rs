@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use app::{App, InputMode, Panel};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -71,6 +71,9 @@ fn main() -> Result<()> {
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("Failed to enter alternate screen")?;
+    io::stdout()
+        .execute(EnableMouseCapture)
+        .context("Failed to enable mouse capture")?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("Failed to create terminal")?;
 
@@ -79,6 +82,9 @@ fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode().context("Failed to disable raw mode")?;
+    io::stdout()
+        .execute(DisableMouseCapture)
+        .context("Failed to disable mouse capture")?;
     io::stdout()
         .execute(LeaveAlternateScreen)
         .context("Failed to leave alternate screen")?;
@@ -154,6 +160,62 @@ impl Drop for StreamListener {
     }
 }
 
+/// Background thread that generates wave data and writes to a Redis stream
+#[allow(dead_code)]
+struct SignalGenerator {
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    watching_key: String,
+}
+
+impl SignalGenerator {
+    fn start(url: &str, key: &str, db: i64, config: app::SignalGenConfig) -> Option<Self> {
+        let mut client = RedisClient::connect(url).ok()?;
+        if db != 0 {
+            client.select_db(db).ok()?;
+        }
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop = stop_flag.clone();
+        let watching_key = key.to_string();
+        let thread_key = watching_key.clone();
+        let sleep_dur = Duration::from_secs_f64(1.0 / config.entries_per_sec);
+
+        let handle = std::thread::spawn(move || {
+            let mut time_offset: f64 = 0.0;
+
+            while !stop.load(Ordering::Relaxed) {
+                let blob = app::generate_wave_blob(&config, time_offset);
+                if client.xadd_binary(&thread_key, "_", &blob).is_err() {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                // Advance phase by freq cycles so next entry continues seamlessly
+                time_offset += config.frequency;
+                std::thread::sleep(sleep_dur);
+            }
+        });
+
+        Some(Self {
+            stop_flag,
+            handle: Some(handle),
+            watching_key,
+        })
+    }
+
+    fn stop(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for SignalGenerator {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &mut RedisClient,
@@ -167,18 +229,26 @@ fn run_app(
     app.connected = client.is_connected();
 
     let mut stream_listener: Option<StreamListener> = None;
+    let mut signal_generator: Option<SignalGenerator> = None;
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         // Poll for events with short timeout
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            // Handle mouse events
+            if let Event::Mouse(mouse) = ev {
+                handle_mouse_event(&mut app, mouse);
+            }
+
+            if let Event::Key(key) = ev {
                 // Stop stream listener on any navigation away
                 let prev_key = app.selected_key_name().map(|s| s.to_string());
 
                 match app.input_mode {
-                    InputMode::Filter => handle_filter_input(&mut app, key.code),
+                    InputMode::Filter => handle_filter_input(&mut app, client, key.code),
                     InputMode::Confirm => handle_confirm_input(&mut app, client, key.code),
                     InputMode::Help => {
                         app.input_mode = InputMode::Normal;
@@ -188,6 +258,32 @@ fn run_app(
                     }
                     InputMode::PlotLimit => {
                         handle_plot_limit_input(&mut app, key.code)
+                    }
+                    InputMode::SignalGen => {
+                        handle_signal_gen_input(&mut app, key.code);
+                        // Check if user pressed Enter to start the generator
+                        if app.input_mode == InputMode::Normal && app.status_message == "Signal gen: starting" {
+                            // Parse config and start generator
+                            let all_types = data::DataType::all();
+                            let config = app::SignalGenConfig {
+                                wave_type: app.signal_gen_wave_type().to_string(),
+                                data_type: all_types[app.signal_gen_dtype_idx],
+                                endianness: app.endianness,
+                                frequency: app.signal_gen_fields[0].1.trim().parse().unwrap_or(1.0),
+                                amplitude: app.signal_gen_fields[1].1.trim().parse().unwrap_or(1.0),
+                                noise: app.signal_gen_fields[2].1.trim().parse().unwrap_or(0.0),
+                                samples_per_entry: app.signal_gen_fields[3].1.trim().parse().unwrap_or(100),
+                                entries_per_sec: app.signal_gen_fields[4].1.trim().parse().unwrap_or(10.0),
+                            };
+                            if let Some(k) = app.selected_key_name().map(|s| s.to_string()) {
+                                signal_generator = SignalGenerator::start(redis_url, &k, app.db, config);
+                                if signal_generator.is_some() {
+                                    app.status_message = format!("Signal gen: running on '{}'", k);
+                                } else {
+                                    app.status_message = "Signal gen: failed to start".to_string();
+                                }
+                            }
+                        }
                     }
                     InputMode::Normal => {
                         handle_normal_input(&mut app, client, key.code, key.modifiers);
@@ -216,17 +312,37 @@ fn run_app(
                             }
                         }
 
-                        // Stop listener if user navigated to a different key
+                        // Toggle signal generator with 'w'
+                        if key.code == KeyCode::Char('w') {
+                            if signal_generator.is_some() {
+                                if let Some(mut sg) = signal_generator.take() {
+                                    sg.stop();
+                                }
+                                app.status_message = "Signal gen: stopped".to_string();
+                            } else if app.is_viewing_stream() {
+                                app.start_signal_gen_popup();
+                            } else {
+                                app.status_message = "Signal gen: select a stream key first (Enter)".to_string();
+                            }
+                        }
+
+                        // Stop listener/generator if user navigated to a different key
                         let new_key = app.selected_key_name().map(|s| s.to_string());
                         if prev_key != new_key {
                             if let Some(mut sl) = stream_listener.take() {
                                 sl.stop();
+                            }
+                            if let Some(mut sg) = signal_generator.take() {
+                                sg.stop();
                             }
                         }
                     }
                 }
             }
         }
+
+        // Check for completed background FFT
+        app.poll_fft();
 
         // Drain any new stream entries from the background listener
         if let Some(ref listener) = stream_listener {
@@ -241,6 +357,7 @@ fn run_app(
         }
 
         if !app.running {
+            drop(signal_generator);
             drop(stream_listener);
             return Ok(());
         }
@@ -272,10 +389,10 @@ fn handle_normal_input(
         }
 
         // Key list navigation
-        KeyCode::Up | KeyCode::Char('k') if app.active_panel == Panel::KeyList => {
+        KeyCode::Up if app.active_panel == Panel::KeyList => {
             app.select_prev_key();
         }
-        KeyCode::Down | KeyCode::Char('j') if app.active_panel == Panel::KeyList => {
+        KeyCode::Down if app.active_panel == Panel::KeyList => {
             app.select_next_key();
         }
         KeyCode::Enter if app.active_panel == Panel::KeyList => {
@@ -283,11 +400,19 @@ fn handle_normal_input(
         }
 
         // Value view scrolling
-        KeyCode::Up | KeyCode::Char('k') if app.active_panel == Panel::ValueView => {
+        KeyCode::Up if app.active_panel == Panel::ValueView => {
             app.scroll_value_up();
         }
-        KeyCode::Down | KeyCode::Char('j') if app.active_panel == Panel::ValueView => {
+        KeyCode::Down if app.active_panel == Panel::ValueView => {
             app.scroll_value_down();
+        }
+
+        // Data plot: arrow keys to select sub-plot when FFT is active
+        KeyCode::Up if app.active_panel == Panel::DataPlot && app.fft_enabled => {
+            app.plot_focus = app::PlotFocus::Signal;
+        }
+        KeyCode::Down if app.active_panel == Panel::DataPlot && app.fft_enabled => {
+            app.plot_focus = app::PlotFocus::FFT;
         }
 
         // Data plot controls
@@ -316,8 +441,16 @@ fn handle_normal_input(
         }
         KeyCode::Char('f') => {
             app.toggle_fft();
+            if !app.fft_enabled {
+                app.plot_focus = app::PlotFocus::Signal;
+            }
             let state = if app.fft_enabled { "ON" } else { "OFF" };
             app.status_message = format!("FFT: {}", state);
+        }
+        KeyCode::Char('g') => {
+            app.fft_log_scale = !app.fft_log_scale;
+            let state = if app.fft_log_scale { "log" } else { "linear" };
+            app.status_message = format!("FFT scale: {}", state);
         }
 
         // Global data type and endianness (work from any panel)
@@ -376,10 +509,11 @@ fn handle_normal_input(
     }
 }
 
-fn handle_filter_input(app: &mut App, code: KeyCode) {
+fn handle_filter_input(app: &mut App, client: &mut RedisClient, code: KeyCode) {
     match code {
         KeyCode::Enter => {
             app.apply_filter();
+            app.refresh_keys(client);
             app.input_mode = InputMode::Normal;
             app.status_message = format!("Filter: {}", app.filter_pattern);
         }
@@ -431,9 +565,32 @@ fn handle_edit_input(
     app: &mut App,
     client: &mut RedisClient,
     code: KeyCode,
-    _modifiers: KeyModifiers,
+    modifiers: KeyModifiers,
 ) {
     let is_new_key = app.edit_operation == Some(app::EditOperation::NewKey);
+
+    // Ctrl+B: toggle binary mode
+    if code == KeyCode::Char('b') && modifiers.contains(KeyModifiers::CONTROL) {
+        app.edit_binary_mode = !app.edit_binary_mode;
+        let state = if app.edit_binary_mode { "ON" } else { "OFF" };
+        app.status_message = format!("Binary encode: {}", state);
+        return;
+    }
+    // Ctrl+T: cycle binary data type
+    if code == KeyCode::Char('t') && modifiers.contains(KeyModifiers::CONTROL) && app.edit_binary_mode {
+        let all = data::DataType::all();
+        // Skip String and Blob types (last two)
+        let max_idx = all.len() - 2;
+        app.edit_binary_dtype_idx = (app.edit_binary_dtype_idx + 1) % (max_idx);
+        app.status_message = format!("Binary type: {}", all[app.edit_binary_dtype_idx]);
+        return;
+    }
+    // Ctrl+E: toggle endianness
+    if code == KeyCode::Char('e') && modifiers.contains(KeyModifiers::CONTROL) && app.edit_binary_mode {
+        app.endianness = app.endianness.toggle();
+        app.status_message = format!("Endianness: {}", app.endianness);
+        return;
+    }
 
     match code {
         KeyCode::Esc => {
@@ -508,6 +665,108 @@ fn handle_edit_input(
     }
 }
 
+fn handle_signal_gen_input(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.input_mode = InputMode::Normal;
+        }
+        KeyCode::Tab => {
+            app.signal_gen_next_field();
+        }
+        KeyCode::BackTab => {
+            app.signal_gen_prev_field();
+        }
+        KeyCode::Left => {
+            match app.signal_gen_focus {
+                0 => {
+                    if app.signal_gen_wave_idx == 0 {
+                        app.signal_gen_wave_idx = app::WAVE_TYPES.len() - 1;
+                    } else {
+                        app.signal_gen_wave_idx -= 1;
+                    }
+                }
+                1 => {
+                    let all = data::DataType::all();
+                    if app.signal_gen_dtype_idx == 0 {
+                        app.signal_gen_dtype_idx = all.len() - 1;
+                    } else {
+                        app.signal_gen_dtype_idx -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Right => {
+            match app.signal_gen_focus {
+                0 => {
+                    app.signal_gen_wave_idx = (app.signal_gen_wave_idx + 1) % app::WAVE_TYPES.len();
+                }
+                1 => {
+                    let all = data::DataType::all();
+                    app.signal_gen_dtype_idx = (app.signal_gen_dtype_idx + 1) % all.len();
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Enter => {
+            let freq: f64 = match app.signal_gen_fields[0].1.trim().parse() {
+                Ok(v) if v > 0.0 => v,
+                _ => {
+                    app.status_message = "Error: invalid cycles/entry".to_string();
+                    return;
+                }
+            };
+            let amp: f64 = match app.signal_gen_fields[1].1.trim().parse() {
+                Ok(v) => v,
+                _ => {
+                    app.status_message = "Error: invalid amplitude".to_string();
+                    return;
+                }
+            };
+            let noise: f64 = match app.signal_gen_fields[2].1.trim().parse() {
+                Ok(v) if v >= 0.0 => v,
+                _ => {
+                    app.status_message = "Error: invalid noise (>= 0)".to_string();
+                    return;
+                }
+            };
+            let samples: usize = match app.signal_gen_fields[3].1.trim().parse() {
+                Ok(v) if v > 0 => v,
+                _ => {
+                    app.status_message = "Error: invalid samples/entry".to_string();
+                    return;
+                }
+            };
+            let rate: f64 = match app.signal_gen_fields[4].1.trim().parse() {
+                Ok(v) if v > 0.0 => v,
+                _ => {
+                    app.status_message = "Error: invalid entries/sec".to_string();
+                    return;
+                }
+            };
+            let _ = (freq, amp, noise, samples, rate);
+            // Signal to the event loop to start the generator
+            app.status_message = "Signal gen: starting".to_string();
+            app.input_mode = InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            if let Some(idx) = app.signal_gen_focus.checked_sub(2) {
+                if let Some((_label, value)) = app.signal_gen_fields.get_mut(idx) {
+                    value.pop();
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(idx) = app.signal_gen_focus.checked_sub(2) {
+                if let Some((_label, value)) = app.signal_gen_fields.get_mut(idx) {
+                    value.push(c);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_plot_limit_input(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => {
@@ -528,9 +787,13 @@ fn handle_plot_limit_input(app: &mut App, code: KeyCode) {
         KeyCode::Enter => {
             match app.apply_plot_limits() {
                 Ok(_) => {
+                    let (label, lo, hi) = match app.plot_focus {
+                        app::PlotFocus::Signal => ("Signal", app.plot_y_min, app.plot_y_max),
+                        app::PlotFocus::FFT => ("FFT", app.fft_y_min, app.fft_y_max),
+                    };
                     app.status_message = format!(
-                        "Plot limits: {:.2} to {:.2}",
-                        app.plot_y_min, app.plot_y_max
+                        "{} limits: {:.2} to {:.2}",
+                        label, lo, hi
                     );
                     app.input_mode = InputMode::Normal;
                 }
@@ -547,6 +810,116 @@ fn handle_plot_limit_input(app: &mut App, code: KeyCode) {
         KeyCode::Char(c) => {
             if let Some((_label, value)) = app.edit_fields.get_mut(app.edit_focus) {
                 value.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
+    let col = mouse.column;
+    let row = mouse.row;
+
+    match mouse.kind {
+        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+            app.mouse_x = col;
+            app.mouse_y = row;
+
+            // Update hover data coordinates
+            if let Some((dx, dy, is_fft)) = app.mouse_to_data(col, row) {
+                app.hover_data_x = Some(dx);
+                app.hover_data_y = Some(dy);
+                app.hover_in_fft = is_fft;
+            } else {
+                app.hover_data_x = None;
+                app.hover_data_y = None;
+            }
+
+            // Handle drag panning
+            if app.mouse_dragging {
+                let is_fft = app.hover_in_fft;
+                let chart_area = if is_fft {
+                    app.fft_chart_area
+                } else {
+                    app.signal_chart_area
+                };
+                if let Some((_cx, _cy, cw, ch)) = chart_area {
+                    let dx_pixels = col as f64 - app.drag_start_x as f64;
+                    let dy_pixels = row as f64 - app.drag_start_y as f64;
+                    let x_range = app.drag_start_plot_x_max - app.drag_start_plot_x_min;
+                    let y_range = app.drag_start_plot_y_max - app.drag_start_plot_y_min;
+                    let dx_data = -dx_pixels * x_range / cw.max(1) as f64;
+                    let dy_data = dy_pixels * y_range / ch.max(1) as f64;
+
+                    if is_fft {
+                        app.fft_x_min = app.drag_start_plot_x_min + dx_data;
+                        app.fft_x_max = app.drag_start_plot_x_max + dx_data;
+                        app.fft_y_min = app.drag_start_plot_y_min + dy_data;
+                        app.fft_y_max = app.drag_start_plot_y_max + dy_data;
+                        app.fft_auto_limits = false;
+                    } else {
+                        app.plot_x_min = app.drag_start_plot_x_min + dx_data;
+                        app.plot_x_max = app.drag_start_plot_x_max + dx_data;
+                        app.plot_y_min = app.drag_start_plot_y_min + dy_data;
+                        app.plot_y_max = app.drag_start_plot_y_max + dy_data;
+                        app.plot_auto_limits = false;
+                    }
+                }
+            }
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            if app.mouse_to_data(col, row).is_some() {
+                app.mouse_dragging = true;
+                app.drag_start_x = col;
+                app.drag_start_y = row;
+                if app.hover_in_fft {
+                    let (x0, x1) = app.fft_x_bounds();
+                    let (y0, y1) = if app.fft_auto_limits {
+                        app.auto_fft_bounds()
+                    } else {
+                        (app.fft_y_min, app.fft_y_max)
+                    };
+                    app.drag_start_plot_x_min = x0;
+                    app.drag_start_plot_x_max = x1;
+                    app.drag_start_plot_y_min = y0;
+                    app.drag_start_plot_y_max = y1;
+                } else {
+                    let (x0, x1) = app.signal_x_bounds();
+                    let (y0, y1) = if app.plot_auto_limits {
+                        app.auto_signal_bounds()
+                    } else {
+                        (app.plot_y_min, app.plot_y_max)
+                    };
+                    app.drag_start_plot_x_min = x0;
+                    app.drag_start_plot_x_max = x1;
+                    app.drag_start_plot_y_min = y0;
+                    app.drag_start_plot_y_max = y1;
+                }
+            }
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            app.mouse_dragging = false;
+        }
+        MouseEventKind::ScrollUp => {
+            if let Some((cx, cy, cw, ch)) = if app.hover_in_fft {
+                app.fft_chart_area
+            } else {
+                app.signal_chart_area
+            } {
+                let frac_x = col.saturating_sub(cx) as f64 / cw.max(1) as f64;
+                let frac_y = 1.0 - row.saturating_sub(cy) as f64 / ch.max(1) as f64;
+                app.zoom_plot(1.3, frac_x.clamp(0.0, 1.0), frac_y.clamp(0.0, 1.0));
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some((cx, cy, cw, ch)) = if app.hover_in_fft {
+                app.fft_chart_area
+            } else {
+                app.signal_chart_area
+            } {
+                let frac_x = col.saturating_sub(cx) as f64 / cw.max(1) as f64;
+                let frac_y = 1.0 - row.saturating_sub(cy) as f64 / ch.max(1) as f64;
+                app.zoom_plot(1.0 / 1.3, frac_x.clamp(0.0, 1.0), frac_y.clamp(0.0, 1.0));
             }
         }
         _ => {}

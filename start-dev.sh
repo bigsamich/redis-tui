@@ -44,102 +44,56 @@ echo "[*] Loading test data..."
 $CLI SET "string:greeting" "Hello, Redis TUI!" >/dev/null
 $CLI SET "string:json_config" '{"debug":true,"log_level":"info","max_connections":100,"features":["auth","caching","streams"]}' >/dev/null
 $CLI SET "string:counter" "42" >/dev/null
-$CLI SET "string:url" "https://example.com/api/v2/data?format=json&limit=500" >/dev/null
-$CLI SET "string:multiline" "line one\nline two\nline three\nline four" >/dev/null
 
-# String with TTL
 $CLI SET "string:ephemeral" "I expire in 300 seconds" >/dev/null
 $CLI EXPIRE "string:ephemeral" 300 >/dev/null
 
-# Binary blob: 16 float32 values (little-endian sine wave)
-# Values: sin(0), sin(pi/8), sin(pi/4), ... sin(15*pi/8)
-python3 -c "
-import struct, math
-vals = [math.sin(i * math.pi / 8) for i in range(16)]
-blob = struct.pack('<16f', *vals)
-import sys; sys.stdout.buffer.write(blob)
-" | $CLI -x SET "blob:float32_sine" >/dev/null
+# ─── Two plain blobs (non-stream) ─────────────────────────
+echo "[*] Generating blobs..."
 
-# Binary blob: 32 uint16 values (little-endian ramp)
+# float32 blob - 1k elements, multi-freq sine
 python3 -c "
-import struct
-vals = list(range(0, 3200, 100))
-blob = struct.pack('<32H', *vals)
-import sys; sys.stdout.buffer.write(blob)
-" | $CLI -x SET "blob:uint16_ramp" >/dev/null
+import struct, math, sys
+n = 1000
+vals = [math.sin(i*0.01) + 0.5*math.sin(i*0.05) + 0.25*math.sin(i*0.13) for i in range(n)]
+sys.stdout.buffer.write(struct.pack(f'<{n}f', *vals))
+" | $CLI -x SET "blob:float32_1k" >/dev/null
+echo "  blob:float32_1k"
 
-# Binary blob: 64 int8 values (square wave)
-python3 -c "
-import struct
-vals = [100 if (i // 8) % 2 == 0 else -100 for i in range(64)]
-blob = struct.pack('<64b', *vals)
-import sys; sys.stdout.buffer.write(blob)
-" | $CLI -x SET "blob:int8_square" >/dev/null
-
-# Binary blob: 8 float64 values (exponential)
-python3 -c "
-import struct, math
-vals = [math.exp(i * 0.5) for i in range(8)]
-blob = struct.pack('<8d', *vals)
-import sys; sys.stdout.buffer.write(blob)
-" | $CLI -x SET "blob:float64_exp" >/dev/null
-
-# Binary blob: mixed noise (raw bytes for hex view)
+# random bytes blob for hex view
 python3 -c "
 import os, sys
-sys.stdout.buffer.write(os.urandom(128))
-" | $CLI -x SET "blob:random_128b" >/dev/null
+sys.stdout.buffer.write(os.urandom(256))
+" | $CLI -x SET "blob:random_256b" >/dev/null
+echo "  blob:random_256b"
 
 # ─── Hashes ───────────────────────────────────────────────
 $CLI HSET "hash:user:1001" name "Alice" email "alice@example.com" age 30 role "admin" active "true" >/dev/null
-$CLI HSET "hash:user:1002" name "Bob" email "bob@example.com" age 25 role "user" active "true" >/dev/null
 $CLI HSET "hash:server:config" host "0.0.0.0" port "8080" workers "4" timeout "30" tls "enabled" >/dev/null
 $CLI HSET "hash:metrics" cpu_pct "23.5" mem_mb "512" disk_gb "47.2" uptime_hrs "168" requests "984321" >/dev/null
 
 # ─── Lists ─────────────────────────────────────────────────
-$CLI RPUSH "list:task_queue" "send_email:user@test.com" "resize_image:photo_001.jpg" "generate_report:Q4_2025" "sync_inventory:warehouse_3" "notify:slack:#ops" >/dev/null
-$CLI RPUSH "list:recent_errors" \
-    '{"ts":"2025-12-01T10:00:00Z","msg":"connection timeout","code":504}' \
-    '{"ts":"2025-12-01T10:05:12Z","msg":"disk full","code":500}' \
-    '{"ts":"2025-12-01T10:11:33Z","msg":"auth failed","code":401}' \
-    '{"ts":"2025-12-01T10:20:00Z","msg":"rate limited","code":429}' >/dev/null
+$CLI RPUSH "list:task_queue" "send_email:user@test.com" "resize_image:photo_001.jpg" "generate_report:Q4_2025" >/dev/null
 $CLI RPUSH "list:numbers" 10 20 30 40 50 60 70 80 90 100 >/dev/null
 
 # ─── Sets ──────────────────────────────────────────────────
-$CLI SADD "set:active_sessions" "sess_a1b2c3" "sess_d4e5f6" "sess_g7h8i9" "sess_j0k1l2" "sess_m3n4o5" >/dev/null
 $CLI SADD "set:tags" "rust" "redis" "tui" "ratatui" "cli" "database" "visualization" >/dev/null
 $CLI SADD "set:blocked_ips" "192.168.1.100" "10.0.0.55" "172.16.0.99" >/dev/null
 
 # ─── Sorted Sets ──────────────────────────────────────────
-$CLI ZADD "zset:leaderboard" 9500 "alice" 8700 "bob" 8200 "charlie" 7100 "diana" 6500 "eve" 5900 "frank" 4200 "grace" 3100 "heidi" >/dev/null
-$CLI ZADD "zset:api_latency_ms" 12.5 "/health" 45.2 "/api/users" 120.8 "/api/search" 230.1 "/api/export" 5.1 "/api/ping" 89.3 "/api/upload" >/dev/null
+$CLI ZADD "zset:leaderboard" 9500 "alice" 8700 "bob" 8200 "charlie" 7100 "diana" 6500 "eve" 5900 "frank" >/dev/null
 $CLI ZADD "zset:temperatures" -10.5 "jan" -2.3 "feb" 5.0 "mar" 12.8 "apr" 20.1 "may" 26.5 "jun" 30.2 "jul" 29.0 "aug" 22.4 "sep" 14.1 "oct" 5.5 "nov" -5.2 "dec" >/dev/null
 
 # ─── Streams ──────────────────────────────────────────────
 
-# Stream with text fields (like a log)
+# Text log stream
 $CLI XADD "stream:app_log" "*" level INFO msg "Application started" service "api" >/dev/null
 $CLI XADD "stream:app_log" "*" level WARN msg "High memory usage detected" service "worker" >/dev/null
 $CLI XADD "stream:app_log" "*" level ERROR msg "Database connection lost" service "api" >/dev/null
-$CLI XADD "stream:app_log" "*" level INFO msg "Reconnected to database" service "api" >/dev/null
-$CLI XADD "stream:app_log" "*" level DEBUG msg "Cache hit ratio: 0.94" service "cache" >/dev/null
 
-# Stream with binary _data blobs (sensor-style, little-endian float32)
-# Each entry has a text field and a _ blob field
+# Small sensor stream (20 entries, float32 _data)
+echo "[*] Generating small sensor stream..."
 for i in $(seq 0 19); do
-    BLOB=$(python3 -c "
-import struct, math, sys
-t = $i * 0.5
-temp = 20.0 + 5.0 * math.sin(t) + 0.5 * (($i * 7) % 3 - 1)
-humidity = 60.0 + 10.0 * math.cos(t * 0.7)
-pressure = 1013.25 + 2.0 * math.sin(t * 0.3)
-accel_x = 0.01 * math.sin(t * 2.0)
-accel_y = 0.01 * math.cos(t * 2.0)
-accel_z = 9.81 + 0.005 * math.sin(t * 5.0)
-blob = struct.pack('<6f', temp, humidity, pressure, accel_x, accel_y, accel_z)
-sys.stdout.buffer.write(blob)
-" | base64)
-    # Use raw bytes via pipeline
     python3 -c "
 import struct, math, sys
 t = $i * 0.5
@@ -149,39 +103,87 @@ pressure = 1013.25 + 2.0 * math.sin(t * 0.3)
 accel_x = 0.01 * math.sin(t * 2.0)
 accel_y = 0.01 * math.cos(t * 2.0)
 accel_z = 9.81 + 0.005 * math.sin(t * 5.0)
-blob = struct.pack('<6f', temp, humidity, pressure, accel_x, accel_y, accel_z)
-# Build RESP protocol for XADD
-args = ['XADD', 'stream:sensor_data', '*', 'sensor_id', 'env-001', '_data', blob.hex()]
-sys.stdout.write('Sensor entry $i done\n')
-" >/dev/null
-    # Actually send via redis-cli using the python blob
-    python3 -c "
-import struct, math, sys
-t = $i * 0.5
-temp = 20.0 + 5.0 * math.sin(t) + 0.5 * (($i * 7) % 3 - 1)
-humidity = 60.0 + 10.0 * math.cos(t * 0.7)
-pressure = 1013.25 + 2.0 * math.sin(t * 0.3)
-accel_x = 0.01 * math.sin(t * 2.0)
-accel_y = 0.01 * math.cos(t * 2.0)
-accel_z = 9.81 + 0.005 * math.sin(t * 5.0)
-blob = struct.pack('<6f', temp, humidity, pressure, accel_x, accel_y, accel_z)
-sys.stdout.buffer.write(blob)
-" | $CLI -x XADD "stream:sensor_data" "*" sensor_id "env-001" _data >/dev/null
+sys.stdout.buffer.write(struct.pack('<6f', temp, humidity, pressure, accel_x, accel_y, accel_z))
+" | $CLI -x XADD "stream:sensor_data" "*" sensor_id "env-001" _ >/dev/null
 done
 
-# Stream with uint16 blob data (simulated ADC readings)
-for i in $(seq 0 29); do
+# ─── Big streams with binary _data ───────────────────────
+echo "[*] Generating big streams..."
+
+generate_big_stream() {
+    local key=$1
+    local count=$2
+    local dtype=$3
+    local fmt=$4
+    local values_per_entry=$5
+
+    echo "  ${key} (${count} entries, ${dtype})..."
+
     python3 -c "
 import struct, math, sys
-t = $i
-ch0 = int(2048 + 2000 * math.sin(t * 0.3))
-ch1 = int(2048 + 1500 * math.cos(t * 0.2))
-ch2 = int(1000 + 500 * (t % 5))
-ch3 = int(4000 - 100 * (t % 10))
-blob = struct.pack('<4H', ch0, ch1, ch2, ch3)
-sys.stdout.buffer.write(blob)
-" | $CLI -x XADD "stream:adc_readings" "*" device "adc-042" _samples >/dev/null
-done
+
+key = '${key}'
+count = ${count}
+fmt = '${fmt}'
+vpe = ${values_per_entry}
+dtype = '${dtype}'
+
+for i in range(count):
+    # Each entry is a waveform: multi-freq sine, shifted by entry index
+    phase_offset = i * 0.3
+    vals = []
+    for j in range(vpe):
+        t = j / vpe * 2 * math.pi + phase_offset
+        v = math.sin(t) + 0.5 * math.sin(3 * t) + 0.25 * math.sin(7 * t)
+        if dtype == 'float32' or dtype == 'float64':
+            vals.append(v)
+        elif dtype == 'int16':
+            vals.append(int(max(-32768, min(32767, 16000 * v))))
+        elif dtype == 'uint16':
+            vals.append(int(max(0, min(65535, 32768 + 18000 * v))))
+        elif dtype == 'int32':
+            vals.append(int(max(-2**31, min(2**31-1, int(1e8 * v)))))
+        elif dtype == 'uint32':
+            vals.append(int(max(0, min(2**32-1, 2**31 + int(5e8 * v)))))
+        elif dtype == 'int8':
+            vals.append(int(max(-128, min(127, 72 * v))))
+        elif dtype == 'uint8':
+            vals.append(int(max(0, min(255, 128 + 72 * v))))
+        else:
+            vals.append(v)
+
+    blob = struct.pack(fmt, *vals)
+
+    parts = ['XADD', key, '*', 'source', 'gen', '_']
+    resp = f'*{len(parts) + 1}\r\n'
+    for p in parts:
+        b = p.encode()
+        resp += f'\${len(b)}\r\n'
+        sys.stdout.buffer.write(resp.encode())
+        sys.stdout.buffer.write(b)
+        sys.stdout.buffer.write(b'\r\n')
+        resp = ''
+    sys.stdout.buffer.write(f'\${len(blob)}\r\n'.encode())
+    sys.stdout.buffer.write(blob)
+    sys.stdout.buffer.write(b'\r\n')
+" | $CLI --pipe >/dev/null 2>&1
+}
+
+# Args: key, num_entries, dtype, struct_fmt, values_per_entry
+# Key names reflect values_per_entry (what gets plotted per entry)
+generate_big_stream "stream:float32_500"  100  "float32" "<500f" 500
+generate_big_stream "stream:float64_200"  100  "float64" "<200d" 200
+generate_big_stream "stream:int16_1000"   100  "int16"   "<1000h" 1000
+generate_big_stream "stream:uint16_500"   100  "uint16"  "<500H" 500
+generate_big_stream "stream:uint8_2000"   100  "uint8"   "<2000B" 2000
+generate_big_stream "stream:int8_1000"    100  "int8"    "<1000b" 1000
+generate_big_stream "stream:int32_200"    100  "int32"   "<200i" 200
+generate_big_stream "stream:uint32_200"   100  "uint32"  "<200I" 200
+
+# ─── Large streams for FFT stress testing ─────────────────
+echo "[*] Generating large streams..."
+generate_big_stream "stream:large_f32_10k"  50  "float32" "<10000f" 10000
+generate_big_stream "stream:large_i16_20k"  50  "int16"   "<20000h" 20000
 
 # ─── Some keys in DB 1 ────────────────────────────────────
 $CLI -n 1 SET "db1:test_key" "This is in database 1" >/dev/null
@@ -190,30 +192,7 @@ $CLI -n 1 HSET "db1:info" description "Alternate database" purpose "testing" >/d
 # ─── Summary ──────────────────────────────────────────────
 echo ""
 echo "=== Test Data Loaded ==="
-echo ""
-echo "DB 0:"
-echo "  Strings:      5 plain + 1 with TTL + 5 binary blobs"
-echo "  Hashes:       4 (users, config, metrics)"
-echo "  Lists:        3 (task queue, errors, numbers)"
-echo "  Sets:         3 (sessions, tags, IPs)"
-echo "  Sorted Sets:  3 (leaderboard, latency, temperatures)"
-echo "  Streams:      3 (app_log, sensor_data with _data blobs, adc_readings with _samples blobs)"
-echo ""
-echo "DB 1:"
-echo "  2 keys (string + hash)"
-echo ""
 echo "Total keys in DB 0: $($CLI DBSIZE | tr -d '\r')"
-echo ""
-echo "Binary blob guide:"
-echo "  blob:float32_sine   - 16x float32 LE  (sine wave)"
-echo "  blob:uint16_ramp    - 32x uint16 LE   (linear ramp)"
-echo "  blob:int8_square    - 64x int8         (square wave)"
-echo "  blob:float64_exp    - 8x float64 LE    (exponential)"
-echo "  blob:random_128b    - 128 random bytes (hex view)"
-echo ""
-echo "Stream blob guide:"
-echo "  stream:sensor_data  _data field    = 6x float32 LE (temp, humidity, pressure, accel xyz)"
-echo "  stream:adc_readings _samples field = 4x uint16 LE  (4 ADC channels)"
 echo ""
 echo "=== Starting Redis TUI ==="
 echo ""
