@@ -288,8 +288,15 @@ fn run_app(
                     InputMode::Normal => {
                         handle_normal_input(&mut app, client, key.code, key.modifiers);
 
-                        // Toggle stream listener with 'p'
-                        if key.code == KeyCode::Char('p') && app.is_viewing_stream() {
+                        // Toggle plot visibility with 'p'
+                        if key.code == KeyCode::Char('p') {
+                            app.plot_visible = !app.plot_visible;
+                            let state = if app.plot_visible { "shown" } else { "hidden" };
+                            app.status_message = format!("Plot: {}", state);
+                        }
+
+                        // Toggle stream listener with 'l'
+                        if key.code == KeyCode::Char('l') && app.is_viewing_stream() {
                             if stream_listener.is_some() {
                                 // Stop
                                 if let Some(mut sl) = stream_listener.take() {
@@ -436,7 +443,7 @@ fn handle_normal_input(
             app.set_auto_limits();
             app.status_message = "Plot: auto limits".to_string();
         }
-        KeyCode::Char('l') => {
+        KeyCode::Char('y') => {
             app.start_set_plot_limits();
         }
         KeyCode::Char('f') => {
@@ -477,6 +484,9 @@ fn handle_normal_input(
             app.start_new_key();
         }
         KeyCode::Char('x') => {
+            app.start_set_x_limits();
+        }
+        KeyCode::Char('z') => {
             if app.current_key_info.is_some() {
                 app.start_set_ttl();
             }
@@ -785,15 +795,30 @@ fn handle_plot_limit_input(app: &mut App, code: KeyCode) {
             }
         }
         KeyCode::Enter => {
-            match app.apply_plot_limits() {
+            let is_x_limit = app.edit_fields.first()
+                .map(|(label, _)| label.contains("X Min"))
+                .unwrap_or(false);
+            let result = if is_x_limit {
+                app.apply_x_limits()
+            } else {
+                app.apply_plot_limits()
+            };
+            match result {
                 Ok(_) => {
-                    let (label, lo, hi) = match app.plot_focus {
-                        app::PlotFocus::Signal => ("Signal", app.plot_y_min, app.plot_y_max),
-                        app::PlotFocus::FFT => ("FFT", app.fft_y_min, app.fft_y_max),
+                    let (label, axis, lo, hi) = if is_x_limit {
+                        match app.plot_focus {
+                            app::PlotFocus::Signal => ("Signal", "X", app.plot_x_min, app.plot_x_max),
+                            app::PlotFocus::FFT => ("FFT", "X", app.fft_x_min, app.fft_x_max),
+                        }
+                    } else {
+                        match app.plot_focus {
+                            app::PlotFocus::Signal => ("Signal", "Y", app.plot_y_min, app.plot_y_max),
+                            app::PlotFocus::FFT => ("FFT", "Y", app.fft_y_min, app.fft_y_max),
+                        }
                     };
                     app.status_message = format!(
-                        "{} limits: {:.2} to {:.2}",
-                        label, lo, hi
+                        "{} {} limits: {:.2} to {:.2}",
+                        label, axis, lo, hi
                     );
                     app.input_mode = InputMode::Normal;
                 }
