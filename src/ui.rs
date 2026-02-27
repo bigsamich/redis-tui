@@ -197,11 +197,12 @@ fn draw_value_view(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::raw(line)));
     }
 
-    let title = if app.active_panel == Panel::ValueView {
-        " Value [Up/Down]Scroll "
-    } else {
-        " Value "
-    };
+    let title = format!(
+        " Value [t]{} [e]{} {}",
+        app.data_type,
+        app.endianness,
+        if app.active_panel == Panel::ValueView { "[Up/Down]Scroll" } else { "" }
+    );
 
     let paragraph = Paragraph::new(lines)
         .block(
@@ -236,8 +237,8 @@ fn draw_data_plot(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     } else { "" };
     let title = format!(
-        " Plot [t]{} [e]{} [a/l]{} [f]FFT:{}{}{}",
-        app.data_type, app.endianness, focused_limits, fft_label, log_label, focus_label
+        " Plot [a]{} [f]FFT:{}{}{}",
+        focused_limits, fft_label, log_label, focus_label
     );
 
     if app.plot_data.is_empty() {
@@ -701,7 +702,7 @@ fn draw_help_popup(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(HIGHLIGHT_COLOR))
-                .title(" Help — Press ? or Esc to close "),
+                .title(" Help — Up/Down to scroll, ? or Esc to close "),
         );
     frame.render_widget(popup, popup_area);
 }
