@@ -78,21 +78,22 @@ redis-tui --url redis://:password@host:6379/2
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Cycle between panels (Key List, Value View, Data Plot) |
-| `Up` / `Down` | Navigate keys or scroll values |
+| `Up` / `Down` | Navigate keys, scroll values, or switch between Signal/FFT plots |
 | `Enter` | Load selected key's value |
 | `0-9` | Switch Redis database |
 
-### Actions
+### Key Operations
 
 | Key | Action |
 |-----|--------|
-| `/` | Filter keys |
+| `/` | Filter keys by glob pattern |
 | `r` | Refresh key list |
 | `s` | Edit selected key's value |
 | `n` | Create new key |
-| `d` | Delete selected key |
-| `x` | Set TTL on selected key |
+| `d` | Delete selected key (with confirmation) |
+| `z` | Set TTL on selected key |
 | `R` | Rename selected key |
+| `p` | Show/hide the plot panel |
 | `?` | Show help |
 | `q` / `Esc` | Quit |
 
@@ -100,12 +101,13 @@ redis-tui --url redis://:password@host:6379/2
 
 | Key | Action |
 |-----|--------|
-| `t` / `T` | Cycle data type forward/backward |
+| `t` / `T` | Cycle data type forward/backward (Int8..Float64, String, Blob) |
 | `e` | Toggle endianness (little/big) |
 | `a` | Auto-fit plot limits |
-| `l` | Manually set plot limits |
-| `f` | Toggle FFT overlay |
-| `g` | Toggle FFT log/linear scale |
+| `x` | Set manual X-axis limits |
+| `y` | Set manual Y-axis limits |
+| `f` | Toggle FFT frequency analysis (split view) |
+| `g` | Toggle FFT Y-axis scale (linear/log) |
 | Mouse drag | Pan |
 | Mouse scroll | Zoom |
 
@@ -113,5 +115,16 @@ redis-tui --url redis://:password@host:6379/2
 
 | Key | Action |
 |-----|--------|
-| `p` | Toggle live stream listener (XREAD) |
+| `l` | Start/stop live stream listener (XREAD) |
 | `w` | Open signal generator / stop running generator |
+
+### Edit Mode
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+B` | Toggle binary encoding mode |
+| `Ctrl+T` | Cycle binary data type |
+| `Ctrl+E` | Toggle endianness |
+| `Tab` / `Shift+Tab` | Navigate between fields |
+| `Enter` | Submit/apply changes |
+| `Esc` | Cancel/close popup |
