@@ -695,19 +695,13 @@ fn draw_help_popup(frame: &mut Frame, app: &App, area: Rect) {
     let max_scroll = total_lines.saturating_sub(inner_height);
     let scroll = app.help_scroll.min(max_scroll);
 
-    let scroll_indicator = if total_lines > inner_height {
-        format!(" Help [{}/{}] — Up/Down to scroll, ? or Esc to close ", scroll + 1, total_lines)
-    } else {
-        " Help — Press ? or Esc to close ".to_string()
-    };
-
     let popup = Paragraph::new(help_text)
         .scroll((scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(HIGHLIGHT_COLOR))
-                .title(scroll_indicator),
+                .title(" Help — Press ? or Esc to close "),
         );
     frame.render_widget(popup, popup_area);
 }
