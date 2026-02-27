@@ -57,29 +57,43 @@ fn draw_title_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
-    // Vertical split: top row (keys + value) | bottom (full-width plot)
-    let v_split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
-        .split(area);
+    if app.plot_visible {
+        // Vertical split: top row (keys + value) | bottom (full-width plot)
+        let v_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(area);
 
-    // Top row: key list | value view side by side
-    let h_split = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(75),
-        ])
-        .split(v_split[0]);
+        // Top row: key list | value view side by side
+        let h_split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(75),
+            ])
+            .split(v_split[0]);
 
-    draw_key_list(frame, app, h_split[0]);
-    draw_value_view(frame, app, h_split[1]);
+        draw_key_list(frame, app, h_split[0]);
+        draw_value_view(frame, app, h_split[1]);
 
-    // Bottom: full-width data plot
-    draw_data_plot(frame, app, v_split[1]);
+        // Bottom: full-width data plot
+        draw_data_plot(frame, app, v_split[1]);
+    } else {
+        // No plot: full height for keys + value
+        let h_split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(75),
+            ])
+            .split(area);
+
+        draw_key_list(frame, app, h_split[0]);
+        draw_value_view(frame, app, h_split[1]);
+    }
 }
 
 fn draw_key_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -538,48 +552,148 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_popup(frame: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(60, 23, area);
+    let popup_area = centered_rect(72, 50, area);
     frame.render_widget(Clear, popup_area);
 
+    let dim = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+
     let help_text = vec![
-        Line::from(Span::styled("Keyboard Shortcuts", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Redis TUI — Keyboard Reference", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from(vec![Span::styled("Navigation", Style::default().fg(Color::Cyan))]),
-        Line::from("  Up/Down         Navigate key list / scroll value"),
-        Line::from("  Enter           Select key / load value"),
-        Line::from("  Tab / Shift+Tab Cycle panels"),
+        // --- Navigation ---
+        Line::from(vec![Span::styled("Navigation", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled("  Up/Down  ", key_style),
+            Span::raw("Navigate the key list, scroll value view, or"),
+        ]),
+        Line::from(Span::styled("            switch between Signal/FFT plots", dim)),
+        Line::from(vec![
+            Span::styled("  Enter    ", key_style),
+            Span::raw("Load the selected key's value and plot its data"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab      ", key_style),
+            Span::raw("Cycle focus: Key List → Value View → Data Plot"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Shift+Tab", key_style),
+            Span::raw("  Cycle focus in reverse"),
+        ]),
         Line::from(""),
-        Line::from(vec![Span::styled("Actions", Style::default().fg(Color::Cyan))]),
-        Line::from("  /               Filter keys"),
-        Line::from("  r               Refresh keys"),
-        Line::from("  s               Set/edit value (Ctrl+B binary mode)"),
-        Line::from("  n               New key"),
-        Line::from("  d               Delete selected key"),
-        Line::from("  p               Toggle stream listen"),
-        Line::from("  w               Signal generator (streams)"),
-        Line::from("  x               Set TTL"),
-        Line::from("  R               Rename key"),
-        Line::from("  0-9             Select database"),
+        // --- Key Operations ---
+        Line::from(vec![Span::styled("Key Operations", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled("  /        ", key_style),
+            Span::raw("Filter keys by glob pattern (e.g. sensor:*)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  r        ", key_style),
+            Span::raw("Refresh the key list from Redis"),
+        ]),
+        Line::from(vec![
+            Span::styled("  s        ", key_style),
+            Span::raw("Edit the selected key's value"),
+        ]),
+        Line::from(Span::styled("            Ctrl+B toggles binary encoding mode", dim)),
+        Line::from(vec![
+            Span::styled("  n        ", key_style),
+            Span::raw("Create a new key (string, list, hash, set, stream)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  d        ", key_style),
+            Span::raw("Delete the selected key (with confirmation)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  R        ", key_style),
+            Span::raw("Rename the selected key"),
+        ]),
+        Line::from(vec![
+            Span::styled("  z        ", key_style),
+            Span::raw("Set TTL (expiry) on the selected key in seconds"),
+        ]),
+        Line::from(vec![
+            Span::styled("  0-9      ", key_style),
+            Span::raw("Switch to Redis database 0-9"),
+        ]),
         Line::from(""),
-        Line::from(vec![Span::styled("Data Plot", Style::default().fg(Color::Cyan))]),
-        Line::from("  t / T           Cycle data type forward/back"),
-        Line::from("  e               Toggle endianness (LE/BE)"),
-        Line::from("  a               Auto-fit Y limits (focused plot)"),
-        Line::from("  l               Set manual Y limits (focused plot)"),
-        Line::from("  f               Toggle FFT analysis"),
-        Line::from("  g               Toggle FFT log/linear scale"),
-        Line::from("  Up/Down         Select signal/FFT plot (when FFT on)"),
+        // --- Streams ---
+        Line::from(vec![Span::styled("Streams", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled("  l        ", key_style),
+            Span::raw("Start/stop live stream listener (XREAD)"),
+        ]),
+        Line::from(Span::styled("            Blocks on the selected stream key for new entries", dim)),
+        Line::from(vec![
+            Span::styled("  w        ", key_style),
+            Span::raw("Open signal generator config (for stream keys)"),
+        ]),
+        Line::from(Span::styled("            Generates sine/square/saw waves into the stream", dim)),
         Line::from(""),
-        Line::from(vec![Span::styled("General", Style::default().fg(Color::Cyan))]),
-        Line::from("  ?               Toggle this help"),
-        Line::from("  q / Esc         Quit (or close popup)"),
+        // --- Data Plot ---
+        Line::from(vec![Span::styled("Data Plot", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled("  p        ", key_style),
+            Span::raw("Show/hide the plot panel (hidden by default)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  t / T    ", key_style),
+            Span::raw("Cycle data type: Int8..Float64, String, Blob"),
+        ]),
+        Line::from(vec![
+            Span::styled("  e        ", key_style),
+            Span::raw("Toggle byte order: Little-Endian ↔ Big-Endian"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a        ", key_style),
+            Span::raw("Auto-fit axis limits to data range"),
+        ]),
+        Line::from(vec![
+            Span::styled("  x        ", key_style),
+            Span::raw("Set manual X-axis limits on the focused plot"),
+        ]),
+        Line::from(vec![
+            Span::styled("  y        ", key_style),
+            Span::raw("Set manual Y-axis limits on the focused plot"),
+        ]),
+        Line::from(vec![
+            Span::styled("  f        ", key_style),
+            Span::raw("Toggle FFT frequency analysis (split view)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  g        ", key_style),
+            Span::raw("Toggle FFT Y-axis: linear ↔ log₁₀ scale"),
+        ]),
+        Line::from(Span::styled("            Use Up/Down to switch focus between Signal and FFT", dim)),
+        Line::from(""),
+        // --- Mouse ---
+        Line::from(vec![Span::styled("Mouse (Plot)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled("  Scroll   ", key_style),
+            Span::raw("Zoom in/out on the plot under the cursor"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Drag     ", key_style),
+            Span::raw("Pan the plot view (X and Y axes)"),
+        ]),
+        Line::from(""),
+        // --- General ---
+        Line::from(vec![Span::styled("General", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled("  ?        ", key_style),
+            Span::raw("Toggle this help screen"),
+        ]),
+        Line::from(vec![
+            Span::styled("  q / Esc  ", key_style),
+            Span::raw("Quit the application (or close a popup)"),
+        ]),
     ];
 
     let popup = Paragraph::new(help_text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(HIGHLIGHT_COLOR))
-            .title(" Help "),
+            .title(" Help — Press ? or Esc to close "),
     );
     frame.render_widget(popup, popup_area);
 }
