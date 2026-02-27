@@ -36,7 +36,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.input_mode {
         InputMode::Filter => draw_filter_popup(frame, app, size),
         InputMode::Confirm => draw_confirm_popup(frame, app, size),
-        InputMode::Help => draw_help_popup(frame, size),
+        InputMode::Help => draw_help_popup(frame, app, size),
         InputMode::Edit => draw_edit_popup(frame, app, size),
         InputMode::PlotLimit => draw_plot_limit_popup(frame, app, size),
         InputMode::SignalGen => draw_signal_gen_popup(frame, app, size),
@@ -551,8 +551,9 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(popup, popup_area);
 }
 
-fn draw_help_popup(frame: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(72, 50, area);
+fn draw_help_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let max_height = area.height.saturating_sub(2).min(50) as u16;
+    let popup_area = centered_rect(72, max_height, area);
     frame.render_widget(Clear, popup_area);
 
     let dim = Style::default().fg(Color::DarkGray);
@@ -689,12 +690,25 @@ fn draw_help_popup(frame: &mut Frame, area: Rect) {
         ]),
     ];
 
-    let popup = Paragraph::new(help_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(HIGHLIGHT_COLOR))
-            .title(" Help — Press ? or Esc to close "),
-    );
+    let total_lines = help_text.len() as u16;
+    let inner_height = popup_area.height.saturating_sub(2); // border top + bottom
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let scroll = app.help_scroll.min(max_scroll);
+
+    let scroll_indicator = if total_lines > inner_height {
+        format!(" Help [{}/{}] — Up/Down to scroll, ? or Esc to close ", scroll + 1, total_lines)
+    } else {
+        " Help — Press ? or Esc to close ".to_string()
+    };
+
+    let popup = Paragraph::new(help_text)
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(HIGHLIGHT_COLOR))
+                .title(scroll_indicator),
+        );
     frame.render_widget(popup, popup_area);
 }
 

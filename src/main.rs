@@ -250,9 +250,18 @@ fn run_app(
                 match app.input_mode {
                     InputMode::Filter => handle_filter_input(&mut app, client, key.code),
                     InputMode::Confirm => handle_confirm_input(&mut app, client, key.code),
-                    InputMode::Help => {
-                        app.input_mode = InputMode::Normal;
-                    }
+                    InputMode::Help => match key.code {
+                        KeyCode::Up => {
+                            app.help_scroll = app.help_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            app.help_scroll = app.help_scroll.saturating_add(1);
+                        }
+                        _ => {
+                            app.help_scroll = 0;
+                            app.input_mode = InputMode::Normal;
+                        }
+                    },
                     InputMode::Edit => {
                         handle_edit_input(&mut app, client, key.code, key.modifiers)
                     }
@@ -382,6 +391,7 @@ fn handle_normal_input(
             app.running = false;
         }
         KeyCode::Char('?') => {
+            app.help_scroll = 0;
             app.input_mode = InputMode::Help;
         }
         KeyCode::Tab => {

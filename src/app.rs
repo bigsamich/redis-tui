@@ -105,6 +105,7 @@ pub struct App {
     pub fft_log_scale: bool,
     pub plot_focus: PlotFocus, // which sub-plot is selected when FFT is on
     pub plot_visible: bool,
+    pub help_scroll: u16,
 
     // Plot viewport (x-axis panning/zooming)
     pub plot_x_min: f64,
@@ -193,6 +194,7 @@ impl App {
             fft_log_scale: false,
             plot_focus: PlotFocus::Signal,
             plot_visible: false,
+            help_scroll: 0,
 
             plot_x_min: 0.0,
             plot_x_max: 0.0, // 0 means auto (full range)
